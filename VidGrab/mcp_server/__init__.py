@@ -1,0 +1,1 @@
+# VidGrab MCP Server
