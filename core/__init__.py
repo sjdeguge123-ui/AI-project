@@ -1,0 +1,1 @@
+# VidGrab Core Module

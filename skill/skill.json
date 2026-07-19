@@ -1,0 +1,8 @@
+{
+  "name": "VidGrab",
+  "version": "0.1.0",
+  "description": "粘贴视频链接，自动生成带时间戳的结构化摘要",
+  "author": "sjdeguge123-ui",
+  "entry": "main.py",
+  "tools": []
+}
