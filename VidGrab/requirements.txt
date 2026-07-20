@@ -1,24 +1,29 @@
 # VidGrab 依赖列表
 # 安装命令: pip install -r requirements.txt
+# （首次运行 python -m skill 也会自动安装下面这些「必需」依赖，无需手动装）
 
 # 视频/字幕提取
 yt-dlp>=2024.1.0
 bilibili-api-python>=16.0.0
+requests>=2.25.0                 # YouTube watch 页面/字幕兜底请求客户端
+curl_cffi>=0.7.0                 # 模拟 Chrome TLS 握手，绕过 YouTube「确认你不是机器人」校验
 
-# AI 调用（统一接口）
-litellm>=1.0.0
-
-# 语音转录
-openai>=1.0.0          # Whisper API 使用
-faster-whisper>=0.10.0 # 本地 Whisper 模型
+# AI 调用（统一 OpenAI 兼容接口，硅基流动/DeepSeek/OpenAI/Ollama 均可）
+openai>=1.0.0
+faster-whisper>=0.10.0           # 本地 Whisper 转录（免 API Key，吃 CPU/GPU）
 
 # 文档导出
-python-docx>=1.0.0     # Word 导出
-WeasyPrint>=60.0       # PDF 导出
-Pillow>=10.0.0         # 图片导出
+python-docx>=1.0.0               # Word 导出
+markdown>=3.4.0                  # Markdown -> HTML 渲染
+Pillow>=10.0.0                   # 图片（PNG）摘要导出
+xhtml2pdf>=0.2.11               # PDF 导出（纯 Python，自带 reportlab；无系统依赖，跨平台）
 
 # 配置文件解析
 PyYAML>=6.0
 
-# MCP Server
-mcp>=1.0.0
+# ---- 可选（非核心，按需另装，不要放进首次安装）----
+# WeasyPrint>=60.0   # 可选：更高保真 PDF（需系统库 GTK/pango/cairo，Windows 常装不全；
+#                    #        默认 PDF 引擎已用 xhtml2pdf，无需此项。装好则 exporter 自动优先用它）
+# litellm>=1.0.0     # 多模型路由（待接入）
+# mcp>=1.0.0         # MCP Server（待接入）
+

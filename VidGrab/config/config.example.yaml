@@ -1,21 +1,69 @@
-# VidGrab 配置文件示例
-# 复制本文件为 config.yaml，填入你的配置
+# VidGrab 配置模板（提交到 git，无 Key，任何人可复制使用）
+# 复制为 config.yaml 后填入你自己的 Key / Cookie：
+#   cp config/config.example.yaml config/config.yaml
+#
+# 多用户说明：本文件不含任何密钥。每个人都用自己的 Key（AI 摘要、B站登录等），
+# 不会上传给开发者。config.yaml 已被 .gitignore 排除，不会误提交。
 
-# AI 服务配置（选填一个即可）
+# AI 摘要服务商配置
+# provider 可选：siliconflow（硅基流动，国内直连，新用户有免费额度）
+#                deepseek（DeepSeek，国内直连）
+#                openai（OpenAI，海外通用，需代理）
+#                ollama（本地自托管，完全离线）
+# base_url：留空则按 provider 用默认；填了则接任意 OpenAI 兼容服务商
+#           （硅基流动 https://api.siliconflow.cn/v1；本地 Ollama http://localhost:11434/v1）
+# api_key：你自己的 Key（首次运行也会交互式引导你填，可不留空在这里）
+# tier：额度类型 free（免费，有 RPM 限频，工具自动加调用间隔）/ paid（付费，RPM 高不主动限速）
+#       首次配置时会交互式让你选；Key 本身看不出免费/付费，所以以你自报为准（默认 free=保守安全）
 ai:
-  # 推荐使用 DeepSeek（国内外可用，有免费额度）
-  provider: deepseek          # 可选: deepseek / openai / claude / gemini / qwen
-  api_key: "sk-your-key-here" # 填入你的 API Key
-  model: "deepseek-chat"      # 默认模型，可不填
+  provider: siliconflow
+  api_key: ""
+  model: "deepseek-ai/DeepSeek-V3"
+  base_url: "https://api.siliconflow.cn/v1"
+  tier: free
 
 # 语音转录配置（无字幕视频时使用）
+# mode: local（本地 faster-whisper，免费、免 Key、需本机装 ffmpeg+模型）
+#       api  （云端 Whisper，按分钟收费，需 OpenAI Key）
+# local_model: tiny / base / small / medium（越大越准越慢）
+# device: auto（自动检测，有 GPU 用 GPU、无 GPU 回退 CPU 并提醒）/ cpu / cuda
+# compute_type: auto（默认，GPU 用 int8_float16 稳且快，CPU 用 int8）/ float16 / int8 / int8_float16
+#               若 GPU 转录闪退，可显式设为 int8 或改 device: cpu
 whisper:
-  mode: api                   # api（云端）或 local（本地）
-  api_key: ""                 # 使用 api 模式时填 OpenAI Key
-  local_model: "base"         # 使用 local 模式时的模型大小: tiny/base/small/medium/large
+  mode: local
+  api_key: ""
+  local_model: "base"
+  device: "auto"
+  compute_type: "auto"
 
 # 输出配置
 output:
-  language: auto              # auto（跟随视频语言）/ zh（中文）/ en（英文）
-  default_format: markdown    # 默认导出格式: markdown / pdf / word / image
-  save_path: ""               # 导出文件保存路径，留空则保存到桌面
+  language: auto
+  default_format: markdown
+  save_path: ""
+
+# B站登录（获取「真字幕」需要 SESSDATA；留空则回退 yt-dlp，只能拿弹幕、无真字幕）
+# 首次运行会引导你用「Get cookies.txt LOCALLY」扩展导出粘贴，自动抽 SESSDATA 存好。
+bilibili:
+  sessdata: ""
+
+# 代理配置（访问 YouTube 等被墙站点需要；B站一般不用）
+# 端口填你本地代理软件的端口（常见 Clash/v2rayN 默认 7890）
+proxy:
+  http: ""
+  https: ""
+
+# YouTube 配置
+# 方式一 cookies_from_browser：让 yt-dlp 直接读你本机浏览器的 Cookie（浏览器名）
+#   取值：chrome / edge / firefox / brave（前提：你在该浏览器已登录 YouTube）。留空则不带。
+# 方式二 cookies_file（最稳）：Netscape 格式 cookies.txt 路径。用浏览器扩展
+#   在已登录 YouTube 的页面导出该文件，把路径填这里。
+youtube:
+  cookies_from_browser: ""
+  cookies_file: ""
+
+# 微信通知（每步任务完成推送到个人微信，可选）
+# serverchan_key：Server酱推送 key（https://sct.ftqq.com）；留空则不推送
+notify:
+  wecom_webhook: ""
+  serverchan_key: ""

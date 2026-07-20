@@ -1,5 +1,20 @@
 # VidGrab 开发计划书 v1.0
-> 最后更新：2026-07-19
+> 最后更新：2026-07-20
+
+---
+
+## 当前进度速查（对应 LOG.md）
+
+| 阶段 | 状态 | 关键文件/说明 |
+|------|------|---------------|
+| Step 0 骨架/config/模板 | ✅ 完成 | `core/__init__.py`、`core/config.py`、`core/templates.py` |
+| Step 1 提取（B站+YouTube） | ✅ 完成 | `core/extractor.py`、`core/platforms/`；B站有字幕实测通过；YouTube 代理已验证可达，bot 校验不稳（待浏览器插件方案） |
+| Step 2 转录（Whisper） | ✅ 完成 | `core/transcriber.py`（API + 本地双模式）；B站音频下载已实现；本地 faster-whisper 用户已装 |
+| Step 3 AI 摘要 | ✅ 完成 | `core/summarizer.py`；OpenAI 兼容客户端，已接硅基流动 DeepSeek-V3（免费）真实跑通 |
+| Step 4 导出 | ✅ 完成 | `core/exporter.py`；Markdown 落盘 `output/`，真实文件已生成 |
+| Step 5 Skill 入口 | ✅ 完成 | `skill/main.py` 一键编排（提取→转录→摘要→导出→微信推送）；配置自举 + AI Key 首次引导已就位 |
+
+> 详细改动、测试方式、下一步见 `docs/LOG.md`。
 
 ---
 
@@ -140,7 +155,61 @@ Phase 5  上线推广             ── 第 16 周起
 
 ---
 
-## 三、逾期目标（当前版本不做，记录备用）
+---
+
+## 二-B、架构原则（已落地，贯穿所有前端形态）
+
+用户明确的方向：**国内为主、兼顾海外；未来做成小程序/Web/浏览器插件；要支持更多视频网站；功能要复用**。据此确立三条不变量，后续所有形态都遵守：
+
+### 1. Provider 可配，代码不分叉
+- AI 摘要：`AIConfig` 含 `provider / api_key / model / base_url`，`summarizer._client_for` 优先用 `base_url`（任意 OpenAI 兼容服务商），否则按 provider 用默认。换 DeepSeek / 硅基流动 / OpenAI / 本地 Ollama **只改配置**。
+- 转录：`whisper.mode` = `local`（本地 faster-whisper，免 Key）/ `api`（云端 Whisper）。
+- 结论：**不把任何服务商写死在代码里**，海外用户用 OpenAI、国内用硅基流动/DeepSeek，纯配置切换。
+
+### 2. Key 用户自持，开发者不介入（多用户安全）
+- 仓库**只提交 `config.example.yaml`（无 Key 模板）**，`config.yaml` 已被 `.gitignore` 排除。
+- 任何人 `git clone` 后直接 `python -m skill`：
+  1. `auth.ensure_config_file()` 发现缺 `config.yaml` → 自动从模板生成；
+  2. `auth.setup_ai()` 首次交互引导选服务商 + 填**自己的** Key，写回本地 `config.yaml`；
+  3. B站/YouTube Cookie 同样交互式粘贴、仅存本地。
+- 我（开发者）的 Key 只在**我自己**的 `config.yaml` 里，**绝不进 git**；别人用的全是他们自己的 Key。
+
+### 3. 逻辑后端化，前端做薄客户端
+- **重活（提取+转录+摘要+导出）只跑在「你控制的机器/自托管服务器」**，前端（桌面 CLI / 网页 / 小程序 / 浏览器插件）只负责**传视频 URL + 展示结果**。
+- 原因（平台硬约束）：小程序是 JS 沙箱、网页/插件跑在浏览器，**不能让用户装 ffmpeg + whisper 模型**（GB 级、装不了）。本地转录工具只适合桌面 CLI 或自托管后端。
+- 复用性：一套 `core/`，四种前端共用，满足「更多网站 + 多形态」诉求。
+
+---
+
+## 二-C、后端服务化（FastAPI）规划 —— 对应 Phase 3-7 / 未来扩展
+
+> 用户原话：「以后后端功能可以考虑放到服务器上，当然需要你引导」。以下为**规划**，当前 Phase 0 仍以桌面 CLI 为主，不写代码。
+
+### 为什么需要
+- 小程序 / Web / 浏览器插件**无法在本端跑转录**（见原则 3），必须有一个后端把 `core` 包成 HTTP 服务，替前端完成重活。
+- 用户在后端服务器装一次 ffmpeg + whisper 模型，所有终端用户**零安装**。
+
+### 形态（最小可用）
+```
+前端（小程序/Web/插件）  --HTTP JSON-->  FastAPI 后端  --调用-->  core（提取/转录/摘要/导出）
+                                      ↑
+                              用户自己的 Key 存后端 config（或按用户隔离）
+```
+- `POST /summarize`：`{"url": "...", "user_key": "可选"}` → 后端跑完整链 → 返回 Markdown / 文件路径。
+- `core` 当前已是纯函数 + dataclass，**几乎无改造即可被 FastAPI 调用**（提取/转录/摘要/导出都是同步函数，套一层 `BackgroundTasks` 即可异步）。
+
+### 落地要点（将来实施时）
+1. `core` 保持无状态、无全局副作用（目前基本满足）。
+2. Key 管理：多用户场景建议「用户自带 Key」或「服务端统一 Key + 按量计费」，不混用。
+3. 资源：转录吃 CPU/GPU，后端需队列（Celery/ARQ）避免并发挤爆；视频文件落临时盘、定期清理（`.gitignore` 已忽略 `*.mp3/*.wav/temp/`）。
+4. YouTube：bot 校验在服务器 IP 上同样存在，长期靠「浏览器插件在用户已登录浏览器里抓完，把 transcript JSON 传给后端」绕开——插件形态反而最稳。
+
+### 与现有计划的关系
+- Phase 2（浏览器插件）的「2-4 调用核心逻辑」、Phase 3（小程序）的「3-7 后端 API」、Phase 4（Web）的「4-8 部署」都收敛到同一个 FastAPI 后端。优先级建议：**先插件（最易绕开 YouTube 校验），再小程序/Web 共用后端**。
+
+---
+
+## 三、预期目标（当前版本不做，记录备用）
 
 - 本地文件上传（视频/音频）
 - 关键帧视觉分析

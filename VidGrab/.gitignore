@@ -46,3 +46,20 @@ logs/
 node_modules/
 .next/
 .nuxt/
+
+# 微信推送模块（个人便利功能，不纳入版本控制；如不满意可直接删除 core/notify.py）
+core/notify.py
+
+# 用户登录凭证（浏览器导出的 cookies.txt，含会话，绝不提交）
+config/youtube_cookies.txt
+config/*.cookies.txt
+
+# 临时验证脚本（沙箱调试用，含硬编码本地路径，不入库）
+nosub_harness.py
+nosub_harness.log
+
+# 本地 Whisper 模型权重（沙箱用 curl 拉取；用户本机由 HuggingFace 首次运行自动下载，不入库）
+models/
+
+# 项目级 agent 工作记忆（含本地开发日志/偏好，不入库）
+.workbuddy/
