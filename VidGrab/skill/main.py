@@ -413,7 +413,7 @@ def _run_bilibili(url: str, cfg, force_audio: bool = False, page_index: int | No
                 print(f"\n❌ 转录失败：{exc}")
                 print(traceback.format_exc())
                 print("💡 建议排查：")
-                print("   1) 若使用 GPU 转录中断，请在 config.yaml 设置 whisper.device: cpu，或 whisper.compute_type: int8，或加 --audio 用短视频复测")
+                print("   1) 长视频已自动分块转录（每 5 分钟一块），若仍报内存分配失败，可调小 core/transcriber.py 的 _CHUNK_SEC")
                 print("   2) 若模型下载失败，可设置 HF_HUB_OFFLINE=1 并手动下载模型到 models/faster-whisper-base/")
                 print("   3) 不想折腾本地环境，可改 config.yaml whisper.mode: api（需 OpenAI Key）")
                 return 1

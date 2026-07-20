@@ -174,40 +174,90 @@ def _transcribe_local(audio_path: Path, model_size: str, device: str = "auto", c
                 "建议：检查网络、确认模型目录完整，或改用云端模式（whisper.mode: api）。"
             ) from exc
 
-    # 预先把音频转成 16kHz mono WAV，避免 faster-whisper 内部读取/重采样时触发 GPU 端崩溃
+    # 预先把音频转成 16kHz mono WAV，避免 faster-whisper 内部读取/重采样时触发端崩溃
     wav_path = _ensure_wav_16k_mono(audio_path)
 
-    print("   🎙️ 开始转录，请稍候（无字幕视频需整段本地推理，期间会显示进度）...")
+    # 关键：分块转录。直接把整段文件路径丢给 model.transcribe() 会让 faster-whisper
+    # 一次性解码 + 全量 STFT（feature_extractor 对整段音频建帧数组 + rfft 复数数组），
+    # 长视频（30min+）峰值需要数 GB 连续主机内存、且要求一次性分配，空闲内存波动时
+    # 会间歇性抛 numpy ArrayMemoryError（表现为「时好时坏、转录后自己结束」）。
+    # 改为：先解码成 16kHz mono numpy（33min 约 128MB），再按 CHUNK_SEC 秒切片逐块转录，
+    # 每块特征数组只有几分钟大小（峰值降两个数量级），并按块起点偏移拼接时间戳。
+    print("   🎙️ 开始转录，请稍候（长音频自动分块，期间会显示进度）...")
+    segments = _transcribe_chunked(model, wav_path)
+    print(f"   ✅ 转录完成：{len(segments)} 段文字")
+    return segments
+
+
+# 单块时长（秒）：5 分钟。足够小以规避大额连续内存分配，又不至于块数过多。
+_CHUNK_SEC = 300
+_SAMPLE_RATE = 16000
+
+
+def _transcribe_chunked(model, wav_path: Path) -> List[Segment]:
+    """把音频解码成 numpy，按固定时长切片逐块转录，拼接时间戳。
+
+    为什么这样能根治 OOM：faster-whisper 的 feature_extractor 会对「喂进来的整段音频」
+    一次性做 STFT。传文件路径 = 整段一起算，长视频峰值内存爆炸；传「切好的短数组」=
+    每次只算几分钟，峰值内存恒定在几十 MB，无论视频多长都稳定。
+    """
+
+    import numpy as np
+    from faster_whisper.audio import decode_audio
+
     try:
-        segments_gen, _info = model.transcribe(str(wav_path), beam_size=5, word_timestamps=False)
+        audio = decode_audio(str(wav_path), sampling_rate=_SAMPLE_RATE)
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError(
-            f"faster-whisper 转录过程出错：{exc}\n"
-            "常见原因：① 音频文件损坏 ② GPU 显存不足/驱动异常 ③ 模型与硬件不匹配。\n"
-            "建议：尝试在 config.yaml 设置 whisper.device: cpu 或 whisper.compute_type: int8，\n"
-            "      或改用 whisper.mode: api 云端转录。"
+            f"音频解码失败：{exc}\n"
+            "常见原因：① 音频文件损坏 ② ffmpeg 不可用。\n"
+            "建议：确认 ffmpeg 可用（本工具内置 imageio-ffmpeg），或改用 whisper.mode: api 云端转录。"
         ) from exc
 
+    audio = np.asarray(audio, dtype="float32")
+    total_samples = int(audio.shape[0])
+    total_dur = total_samples / _SAMPLE_RATE
+    chunk_samples = _CHUNK_SEC * _SAMPLE_RATE
+    n_chunks = max(1, (total_samples + chunk_samples - 1) // chunk_samples)
+
     segments: List[Segment] = []
-    _duration = getattr(_info, "duration", None)
     _last_log = _time.time()
     _count = 0
-    for seg in segments_gen:
-        text = (seg.text or "").strip()
-        if text:
-            segments.append(Segment(start=float(seg.start), end=float(seg.end), text=text))
-        _count += 1
-        # 周期性打印进度，避免长视频转录时「静默假死」让用户误以为卡住
-        _now = _time.time()
-        if _now - _last_log >= 15:
-            _last_log = _now
-            if _duration:
-                _pct = int((seg.end or 0) / _duration * 100) if seg.end else 0
+    for ci in range(n_chunks):
+        s0 = ci * chunk_samples
+        s1 = min(total_samples, s0 + chunk_samples)
+        offset = s0 / _SAMPLE_RATE  # 该块在整段音频中的起始秒数，用于还原全局时间戳
+        clip = audio[s0:s1]
+        try:
+            seg_gen, _info = model.transcribe(clip, beam_size=5, word_timestamps=False)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                f"faster-whisper 转录过程出错（第 {ci + 1}/{n_chunks} 块）：{exc}\n"
+                "常见原因：① 音频文件损坏 ② 内存/显存异常 ③ 模型与硬件不匹配。\n"
+                "建议：尝试在 config.yaml 设置 whisper.device: cpu 或 whisper.compute_type: int8，\n"
+                "      或改用 whisper.mode: api 云端转录。"
+            ) from exc
+
+        for seg in seg_gen:
+            text = (seg.text or "").strip()
+            if text:
+                segments.append(
+                    Segment(start=float(seg.start) + offset, end=float(seg.end) + offset, text=text)
+                )
+            _count += 1
+            _now = _time.time()
+            if _now - _last_log >= 15:
+                _last_log = _now
+                cur = (seg.end or 0) + offset
+                _pct = int(cur / total_dur * 100) if total_dur else 0
                 _pct = max(0, min(100, _pct))
-                print(f"   ⏳ 转录进度：{_fmt_ts(seg.end)} / {_fmt_ts(_duration)}（{_pct}%，已 {_count} 段）")
-            else:
-                print(f"   ⏳ 转录中… 已 {_count} 段")
-    print(f"   ✅ 转录完成：{len(segments)} 段文字")
+                print(f"   ⏳ 转录进度：{_fmt_ts(cur)} / {_fmt_ts(total_dur)}（{_pct}%，已 {_count} 段，块 {ci + 1}/{n_chunks}）")
+
+        # 每块结束打印一次，让用户看到分块推进
+        done_dur = s1 / _SAMPLE_RATE
+        _dpct = int(done_dur / total_dur * 100) if total_dur else 100
+        print(f"   ✅ 已完成第 {ci + 1}/{n_chunks} 块（累计 {_fmt_ts(done_dur)} / {_fmt_ts(total_dur)}，{_dpct}%）")
+
     return segments
 
 
