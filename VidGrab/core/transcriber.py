@@ -264,8 +264,13 @@ def _transcribe_local(audio_path: Path, model_size: str, device: str = "auto", c
                 use_compute_type = "int8"
                 use_chunk_sec = 30
 
-        # CPU 路径时降低 MKL/OpenMP 线程数，减少瞬时内存分配与线程冲突
+        # 子进程环境变量：
+        #  - CT2_CUDA_ALLOCATOR=cuda_malloc_async：根治 Windows 下 CUDA 默认分配器的
+        #    显存碎片化，避免长视频 GPU 转录中途「Unable to allocate ... MiB」与进程退出时
+        #    硬崩溃（STATUS_STACK_BUFFER_OVERRUN, exit 3221226505）。实测 40min 视频稳定通过。
+        #  - CPU 路径再降 MKL/OpenMP 线程数，减少瞬时内存分配与线程冲突。
         env = os.environ.copy()
+        env["CT2_CUDA_ALLOCATOR"] = "cuda_malloc_async"
         if use_device == "cpu":
             env["OMP_NUM_THREADS"] = "1"
             env["MKL_NUM_THREADS"] = "1"
