@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from .. import Platform, Segment, Transcript
-from ..lang import _detect_language
+from ..lang import _detect_language, _normalize_chinese
 from ..subtitles.parsers import parse_bilibili_json, _ts_to_date
 from ..guide import bilibili_login_guide
 from ._ytdlp import _ydl_extract_subtitles, _ydl_download_audio
@@ -245,7 +245,14 @@ def _fetch_bilibili_subtitle(sub_info: dict, workdir: Optional[Path]) -> List[Se
     resp = requests.get(url, timeout=30)
     resp.raise_for_status()
     path.write_bytes(resp.content)
-    return parse_bilibili_json(path)
+    segments = parse_bilibili_json(path)
+    # B站字幕可能是繁体/台湾字幕（zh-Hant），统一规范为简体中文
+    if _detect_language(segments) == "zh":
+        segments = [
+            Segment(start=s.start, end=s.end, text=_normalize_chinese(s.text or ""))
+            for s in segments
+        ]
+    return segments
 
 
 def _extract_bilibili_subtitle_via_ytdlp(url: str, workdir: Optional[Path]) -> List[Segment]:

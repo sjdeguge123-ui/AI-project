@@ -99,9 +99,9 @@ def test_language_instruction_follows_video():
     # 英文视频：英文输出，绝不强制中文
     assert "English" in en
     assert "简体中文" not in en
-    # 未知/auto/空：要求先判断视频文字稿语种再输出，不强行统一成中文
+    # 未知/auto/空：要求先判断视频文字稿语种再输出，不强行统一成中文/英文/日文/韩文
     assert "判断" in auto and "判断" in auto2
-    assert "不要擅自把英文内容翻译成中文" in auto
+    assert "不要擅自把内容翻译成其他语言" in auto
 
 
 if __name__ == "__main__":

@@ -9,12 +9,13 @@ from typing import Iterable
 
 
 def _detect_language(segments) -> str:
-    """按文本中的中文字符占比判断真实语种。
+    """按文本中的字符脚本判断真实语种。
 
-    规则：
-    - 文本中 CJK 字符占比 > 8% 视为 'zh'。
-    - 否则视为 'en'（Phase 0 仅处理中文/英文，其他语种统一归到 'en'，
-      由 LLM 根据实际文本自由发挥，避免误判）。
+    规则（按优先级）：
+    - 含日文假名（平假名/片假名）→ 'ja'。
+    - 含韩文 Hangul → 'ko'。
+    - 文本中 CJK 字符占比 > 8% → 'zh'。
+    - 否则 → 'en'。
     - 空文本返回 ''，交给上层再判定。
 
     为什么阈值是 8%：
@@ -24,6 +25,12 @@ def _detect_language(segments) -> str:
     text = " ".join(getattr(s, "text", "") or "" for s in (segments or []))
     if not text.strip():
         return ""
+    # 日文假名
+    if any("\u3040" <= ch <= "\u309f" or "\u30a0" <= ch <= "\u30ff" for ch in text):
+        return "ja"
+    # 韩文 Hangul
+    if any("\uac00" <= ch <= "\ud7af" for ch in text):
+        return "ko"
     cjk = sum(1 for ch in text if "一" <= ch <= "鿿")
     return "zh" if cjk / max(1, len(text)) > 0.08 else "en"
 
@@ -32,11 +39,20 @@ def _normalize_chinese(text: str) -> str:
     """把中文文本统一规范为简体中文。
 
     使用 OpenCC 进行繁简转换（优先纯 Python 实现的 opencc-python-reimplemented，
-    无需系统库）。若未安装或转换失败，直接回退原文，绝不阻塞主流程。
+    无需系统库）。若文本含日文假名或韩文 Hangul，则判定非中文并直接回退原文，
+    避免把日文/韩文汉字误当繁体中文简化。
 
-    仅对中文视频内容做规范化；英文/其他语种原文不动。
+    若未安装 opencc 或转换失败，直接回退原文，绝不阻塞主流程。
     """
     if not text:
+        return text
+    # 安全守卫：含日文假名或韩文 Hangul 的文本不归为中文，不转换
+    if any(
+        "\u3040" <= ch <= "\u309f"  # 平假名
+        or "\u30a0" <= ch <= "\u30ff"  # 片假名
+        or "\uac00" <= ch <= "\ud7af"  # Hangul
+        for ch in text
+    ):
         return text
     try:
         import opencc

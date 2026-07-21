@@ -167,6 +167,14 @@ def transcribe(transcript: Transcript, config: Optional[WhisperConfig] = None) -
 
     # 根据实际转录结果判定语种，确保后续摘要/全文文案跟随音频真实语种
     detected_language = _detect_language(segments)
+    # 中文音频转录结果统一规范为简体中文（覆盖繁体口音/台湾用字）
+    if detected_language == "zh":
+        from .lang import _normalize_chinese
+
+        segments = [
+            Segment(start=s.start, end=s.end, text=_normalize_chinese(s.text or ""))
+            for s in segments
+        ]
     return Transcript(
         platform=transcript.platform,
         video_id=transcript.video_id,

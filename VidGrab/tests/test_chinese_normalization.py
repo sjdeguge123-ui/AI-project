@@ -39,3 +39,16 @@ def test_build_chunk_text_converts_traditional():
     text = _build_chunk_text(segments)
     assert "这是一个繁体字幕" in text
     assert "這是一個繁體字幕" not in text
+
+
+def test_build_full_text_japanese_unchanged():
+    """日文 segment 在 _build_full_text 中保持原样（调用方按 language 守卫，不会误转）。"""
+    from core.lang import _detect_language
+
+    segments = [
+        Segment(start=0.0, end=2.0, text="図書館で本を読みます"),
+    ]
+    assert _detect_language(segments) == "ja"
+    text = _build_full_text(segments)
+    assert "図書館" in text
+    assert "图书馆" not in text
