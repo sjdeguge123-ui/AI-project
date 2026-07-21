@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from .. import Platform, Segment, Transcript
+from ..lang import _detect_language
 from ..subtitles.parsers import parse_bilibili_json, _ts_to_date
 from ..guide import bilibili_login_guide
 from ._ytdlp import _ydl_extract_subtitles, _ydl_download_audio
@@ -75,19 +76,6 @@ def get_bilibili_pages(url: str, sessdata: str = "") -> dict:
         "duration": float(info.get("duration", 0) or 0),
         "pages": pages,
     }
-
-
-def _detect_language(segments) -> str:
-    """按转录文本中的中文字符占比判断真实语种：中文视频返回 'zh'，否则 'en'。
-
-    B站视频不分语种，之前一律标 'zh' 会导致英文视频被错误加中文标点、且全文语种误判。
-    无文本（如尚未转录的音频路径）返回空串，交给转录/摘要阶段再判定。
-    """
-    text = " ".join(getattr(s, "text", "") or "" for s in segments)
-    if not text.strip():
-        return ""
-    cjk = sum(1 for ch in text if "一" <= ch <= "鿿")
-    return "zh" if cjk / max(1, len(text)) > 0.08 else "en"
 
 
 def extract_bilibili(

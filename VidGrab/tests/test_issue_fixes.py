@@ -25,13 +25,14 @@ def _seg(text):
 
 
 def test_detect_language():
-    from core.platforms.bilibili import _detect_language
+    from core.lang import _detect_language
 
     zh = [_seg("这是一段中文语音识别的文字内容，讲得非常好。")]
     en = [_seg("This is an English transcript of the audio speech.")]
     assert _detect_language(zh) == "zh"
     assert _detect_language(en) == "en"
     assert _detect_language([]) == ""
+    assert _detect_language(None) == ""
 
 
 def test_safe_title_multipp_strips_prefix():
@@ -98,8 +99,9 @@ def test_language_instruction_follows_video():
     # 英文视频：英文输出，绝不强制中文
     assert "English" in en
     assert "简体中文" not in en
-    # 未知/auto/空：跟随视频真实语种，不强行统一成中文
-    assert "跟随" in auto and "跟随" in auto2
+    # 未知/auto/空：要求先判断视频文字稿语种再输出，不强行统一成中文
+    assert "判断" in auto and "判断" in auto2
+    assert "不要擅自把英文内容翻译成中文" in auto
 
 
 if __name__ == "__main__":

@@ -26,6 +26,7 @@ from typing import List, Optional
 
 from . import Segment, Transcript
 from .config import WhisperConfig
+from .lang import _detect_language
 
 try:
     import psutil  # 可选依赖：缺失时跳过内存预检，不阻塞转录
@@ -164,12 +165,15 @@ def transcribe(transcript: Transcript, config: Optional[WhisperConfig] = None) -
             f"未知的 whisper.mode：{config.mode!r}（应为 'api' 或 'local'）。\n{build_whisper_guide()}"
         )
 
+    # 根据实际转录结果判定语种，确保后续摘要/全文文案跟随音频真实语种
+    detected_language = _detect_language(segments)
     return Transcript(
         platform=transcript.platform,
         video_id=transcript.video_id,
         title=transcript.title,
         author=transcript.author,
         publish_time=transcript.publish_time,
+        language=detected_language,
         duration=transcript.duration,
         segments=segments,
         source="transcript",

@@ -26,6 +26,7 @@ from typing import List, Optional
 
 from . import DetailedRow, GoldenQuote, Segment, Summary, Transcript, format_duration, format_timestamp
 from .config import AIConfig
+from .lang import _detect_language
 from .ratelimit import RateLimiter
 
 
@@ -227,8 +228,8 @@ def _language_instruction(language: str) -> str:
 
     - 中文视频（zh）：简体中文 + 中文标点（用户硬性要求：中文必须简体 + 逗号句号断句）。
     - 英文视频（en）：英文输出。
-    - 未知/auto/空：跟随视频音频的实际语种；若音频为中文则用简体中文 + 中文标点，
-      否则用与音频一致的语言。不强行统一成中文。
+    - 未知/auto/空：先在 generate_summary 入口处用 _detect_language 根据实际文本
+      重新判定为 zh/en，不应以空值进入 LLM；若仍为空，则强制要求「先判断视频语种再输出」。
 
     全文文案（transcript）跟随音频真实语种，由 _restore_punctuation 的语种守卫控制，
     不在此处处理。
@@ -237,18 +238,21 @@ def _language_instruction(language: str) -> str:
     if lang == "en":
         return (
             "Output entirely in English, with natural English punctuation and sentence breaks. "
-            "Keep the narrative language English; proper nouns in other languages may stay in original."
+            "All narrative text, chapter points, content summaries, and golden quotes must be in English. "
+            "Do not output Chinese except for proper nouns that are originally in Chinese."
         )
     if lang == "zh":
         return (
             "全部用简体中文输出，并使用中文标点（逗号、句号、问号、感叹号、顿号等）正常断句；"
             "涉及外文专有名词可保留原文（如英文术语、人名），但叙述语言必须是简体中文。"
         )
-    # auto / 空 / 其他未知：跟随视频实际语种，不强行统一为中文
+    # 防御：空/auto/未知不应直接落到 LLM，generate_summary 会先做一次 _detect_language。
+    # 若仍为空，则给出最保守指令：先判断再输出，避免模型默认中文。
     return (
-        "请使用与视频音频相同的语言输出（跟随视频真实语种，不要擅自切换语言）；"
-        "若视频为中文，则用简体中文并加中文标点（逗号、句号等）正常断句，"
-        "若视频为英文等其他语种则用对应语言并正常断句。"
+        "请先判断视频文字稿的主要语种，然后使用与文字稿相同的语言输出；"
+        "若文字稿主要是中文，则用简体中文并加中文标点断句；"
+        "若主要是英文，则全部用英文输出（包括章节要点、内容总结、金句）。"
+        "不要混合语言，不要擅自把英文内容翻译成中文。"
     )
 
 
@@ -260,19 +264,6 @@ def _needs_punctuation(text: str) -> bool:
     """文本中基本没有 CJK 标点时才需要补标点。"""
 
     return not any(ch in _CJK_PUNCT for ch in (text or ""))
-
-
-def _detect_language(segments) -> str:
-    """按转录文本中的中文字符占比判断真实语种，用于决定是否做中文标点恢复。
-
-    与 bilibili._detect_language 同源逻辑：中文占比 >8% 视为 'zh'，否则 'en'。
-    空文本返回 ''（不恢复标点）。
-    """
-    text = " ".join(getattr(s, "text", "") or "" for s in segments)
-    if not text.strip():
-        return ""
-    cjk = sum(1 for ch in text if "一" <= ch <= "鿿")
-    return "zh" if cjk / max(1, len(text)) > 0.08 else "en"
 
 
 def _restore_punctuation(text: str, client, ai: AIConfig, proxy: str = "") -> str:
@@ -428,9 +419,10 @@ def _generate_overview(transcript, client, ai: AIConfig, proxy: str, rate_limite
     """
 
     head = _build_chunk_text(transcript.segments)[:1500]
+    overview_lang = transcript.language or _detect_language(transcript.segments) or "en"
     sys_p = (
         "你是视频内容分析助手。"
-        + _language_instruction(transcript.language)
+        + _language_instruction(overview_lang)
         + "请用一句话（20-40字）概述整个视频在讲什么，"
         "关键术语用 **加粗** 包裹。只输出这句话本身，不要 JSON、不要任何解释或引号。"
     )
@@ -507,8 +499,11 @@ def generate_summary(
     if ai.tier == "free":
         rate_limiter.notify_if_free()
 
-    # 输出语言跟随视频语种
-    lang_inst = _language_instruction(transcript.language)
+    # 输出语言跟随视频语种；若 transcript.language 为空/未知，按实际文本重新判定
+    detected_lang = transcript.language or _detect_language(transcript.segments)
+    if not detected_lang and transcript.segments:
+        detected_lang = "en"  # 非空但无 CJK 时，默认英文更合理（避免模型默认中文）
+    lang_inst = _language_instruction(detected_lang)
 
     # 全文文案模式：不调 AI 分章，直接输出带时间戳的连续转录文案（内容概述仍用一次轻量调用生成）
     if mode == "fulltext":
