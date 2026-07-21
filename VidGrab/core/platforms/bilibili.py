@@ -46,6 +46,61 @@ def _extract_bvid(url: str) -> str:
     return m.group(1)
 
 
+def _get_bilibili_cid(url: str, sessdata: str = "", page_index: int = 0) -> int:
+    """根据 URL 与选集索引取得对应 cid；失败返回 0。"""
+
+    _check_bilibili_api_installed()
+    from bilibili_api import Credential, video, sync
+
+    bvid = _extract_bvid(url)
+    cred = Credential(sessdata=sessdata) if sessdata else None
+    v = video.Video(bvid=bvid, credential=cred)
+    info = sync(v.get_info())
+    raw_pages = info.get("pages") or []
+    if len(raw_pages) <= 1:
+        try:
+            _pp = sync(v.get_pages()) or []
+            if len(_pp) > 1:
+                raw_pages = _pp
+        except Exception:
+            pass
+    if raw_pages and len(raw_pages) > 1:
+        return (raw_pages[page_index] or {}).get("cid", 0) or 0
+    cid = info.get("cid") or 0
+    if not cid:
+        try:
+            pages = sync(v.get_pages())
+            cid = (pages[0] or {}).get("cid", 0) or 0
+        except Exception:
+            cid = 0
+    return cid
+
+
+def list_bilibili_subtitle_languages(url: str, sessdata: str = "", page_index: int = 0) -> List[str]:
+    """查询 B站视频当前选集有哪些字幕语言（不下载字幕内容）。
+
+    用于在交互流程中判断「原语种 / 中文翻译」选项是否有意义：
+    - 无字幕 / 只有中文 / 只有非中文 → 跳过询问，默认原语种；
+    - 同时有中文与非中文 → 才需要让用户选。
+    """
+
+    _check_bilibili_api_installed()
+    from bilibili_api import Credential, video, sync
+
+    cid = _get_bilibili_cid(url, sessdata=sessdata, page_index=page_index)
+    if not cid:
+        return []
+    try:
+        bvid = _extract_bvid(url)
+        cred = Credential(sessdata=sessdata) if sessdata else None
+        v = video.Video(bvid=bvid, credential=cred)
+        sub_info = sync(v.get_subtitle(cid=cid)) or {}
+    except Exception:
+        return []
+    subtitles = sub_info.get("subtitles") or sub_info.get("regular_subtitles") or []
+    return [str(s.get("lan", "")) for s in subtitles]
+
+
 def get_bilibili_pages(url: str, sessdata: str = "") -> dict:
     """查询 B站视频的分P信息。返回 {title, author, duration, pages: [{index, cid, part, duration}]}。
 

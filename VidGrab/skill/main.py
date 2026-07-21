@@ -134,6 +134,7 @@ if sys.platform == "win32":
 
 from core import config, extractor, auth, transcriber, summarizer, exporter, notify, Platform, format_duration  # noqa: E402
 from core.platforms import get_bilibili_pages  # noqa: E402
+from core.platforms.bilibili import list_bilibili_subtitle_languages  # noqa: E402
 from core import log  # noqa: E402
 
 log.setup_logging(ROOT)
@@ -510,11 +511,9 @@ def _export_one(t, cfg, proxy: str, formats: list, mode: str, keywords: str = ""
         "fulltext": "全文文案（带时间戳全文）",
     }
     mode_label = _short_mode_label(mode, keywords)
-    # 可见分隔横幅：让每次导出在控制台清晰分开（解决多次导出输出混乱）
-    print(f"\n{'─' * 50}")
-    print(f"  ▌第 {version_no} 版 · {_MODE_LABEL.get(mode, mode)}")
-    print(f"  ▌导出格式：{', '.join(formats)}")
-    print(f"{'─' * 50}")
+    # 仅在追加版本（version_no > 1）时极简提示，避免首版输出冗余横幅
+    if version_no > 1:
+        print(f"\n   正在生成第 {version_no} 版 · {_MODE_LABEL.get(mode, mode)} ...")
 
     # ⏱️ AI 摘要预估时间（转录已完成，这里只估算 AI 摘要部分，提前告知用户）
     if mode != "fulltext":
@@ -547,7 +546,9 @@ def _offer_other_versions(t, cfg, proxy: str, formats: list, first_mode: str, fi
     version_no = 2  # 首版已导出，追加从 2 开始
     while True:
         head = f"《{title}》" if title else ""
-        print(f"\n💡 {head}已导出 {version_no - 1} 版，是否还要其他版本？")
+        # 用明显分隔线区分不同版本的交互，避免输出混在一起
+        print("\n" + "=" * 50)
+        print(f"💡 {head}已导出 {version_no - 1} 版，是否还要其他版本？")
         print("   1. 精简   2. 详细   3. 自定义（关键词）   4. 全文文案   5. 不需要了，退出")
         try:
             # 标题已在上方 💡 行展示，输入提示不再重复，避免冗余
@@ -580,18 +581,11 @@ def _offer_other_versions(t, cfg, proxy: str, formats: list, first_mode: str, fi
             print("   ⚠️ 无效选择，请重试。")
             continue
 
-        # 追加版本：复用首次格式，但允许用户更换（回车沿用；输入新格式如 md,html 则改）
-        try:
-            fmt_in = _timed_input(
-                f"   复用格式：{', '.join(formats)}（回车沿用，或输入新格式如 md,html）：",
-                timeout=30,
-            )
-        except TimeoutError:
-            fmt_in = ""
-        if fmt_in:
-            new_formats = _select_formats(forced=fmt_in, title=title)
-            if new_formats:
-                formats = new_formats
+        # 追加版本：让用户像首次一样重新选择格式（含 0 全选、1-5 多选），而不是只复用
+        print(f"   当前格式：{', '.join(formats)}")
+        new_formats = _select_formats(title=title)
+        if new_formats:
+            formats = new_formats
 
         if m in tried:
             print(f"   （{m} 已生成过，重新生成一次）")
@@ -632,8 +626,21 @@ def _run_bilibili(url: str, cfg, force_audio: bool = False, page_index: int | No
     print("\n【步骤 ③】检测视频信息（合集会让你选集）...")
     page_index = _select_page(url, sessdata, forced=page_index)
 
-    # ③-1 语种来源（原语种 / 中文翻译）—— 影响字幕选择与后续语种指令
-    lang_source = _select_language_source(title="")
+    # ③-1 语种来源（原语种 / 中文翻译）—— 仅当字幕有「原语种 vs 中文」真实选择时才询问
+    # 无字幕 / 只有中文 / 只有非中文时跳过，避免用户困惑（对无字幕视频该选项本就不生效）
+    lang_source = "original"
+    if not force_audio and sys.stdin.isatty():
+        try:
+            sub_langs = list_bilibili_subtitle_languages(url, sessdata=sessdata, page_index=page_index)
+            has_zh = any("zh" in (lan or "").lower() for lan in sub_langs)
+            has_non_zh = any("zh" not in (lan or "").lower() for lan in sub_langs)
+            if has_zh and has_non_zh:
+                lang_source = _select_language_source(title="")
+            elif sub_langs:
+                print(f"\n   该视频字幕语言：{', '.join(sub_langs)}，直接按原语种处理。")
+        except Exception:  # noqa: BLE001
+            # 查询失败不影响主流程，默认原语种
+            pass
 
     if force_audio:
         print(f"\n   强制音频转录模式（--audio）：忽略字幕，直接下载音频转录")

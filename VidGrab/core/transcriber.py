@@ -64,6 +64,7 @@ atexit.register(_kill_active_worker)
 if sys.platform == "win32":
     try:
         import ctypes
+        from ctypes import wintypes
 
         _kernel32 = ctypes.windll.kernel32
 
@@ -77,6 +78,72 @@ if sys.platform == "win32":
 
         _HANDLER = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_uint)
         _kernel32.SetConsoleCtrlHandler(_HANDLER(_console_ctrl_handler), True)
+
+        # ── Windows Job Object：父进程死亡时自动杀子进程 ──
+        # 根因：atexit/控制台事件/线程看门狗都可能因 agent 强杀父进程或 GIL 被 C 扩展占住而失效。
+        # Job Object 是 OS 级保证：job handle 随父进程关闭，内部所有进程被系统强制终止。
+        _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+        _JobObjectExtendedLimitInformation = 9
+
+        class _IO_COUNTERS(ctypes.Structure):
+            _fields_ = [
+                ("ReadOperationCount", wintypes.ULARGE_INTEGER),
+                ("WriteOperationCount", wintypes.ULARGE_INTEGER),
+                ("OtherOperationCount", wintypes.ULARGE_INTEGER),
+                ("ReadTransferCount", wintypes.ULARGE_INTEGER),
+                ("WriteTransferCount", wintypes.ULARGE_INTEGER),
+                ("OtherTransferCount", wintypes.ULARGE_INTEGER),
+            ]
+
+        class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", wintypes.LARGE_INTEGER),
+                ("PerJobUserTimeLimit", wintypes.LARGE_INTEGER),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_ulonglong),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", _JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                ("IoInfo", _IO_COUNTERS),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        def _create_kill_job() -> Optional[int]:
+            """创建 job object；父进程 handle 关闭时自动 kill 内部所有进程。"""
+            job = _kernel32.CreateJobObjectW(None, None)
+            if not job:
+                return None
+            info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+            info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            ok = _kernel32.SetInformationJobObject(
+                job,
+                _JobObjectExtendedLimitInformation,
+                ctypes.byref(info),
+                ctypes.sizeof(info),
+            )
+            if not ok:
+                _kernel32.CloseHandle(job)
+                return None
+            return job
+
+        def _assign_to_job(job: int, pid: int) -> bool:
+            h = _kernel32.OpenProcess(0x001F0FFF, False, pid)  # PROCESS_ALL_ACCESS
+            if not h:
+                return False
+            try:
+                return bool(_kernel32.AssignProcessToJobObject(job, h))
+            finally:
+                _kernel32.CloseHandle(h)
     except Exception:  # noqa: BLE001
         pass
 
@@ -465,6 +532,16 @@ def _transcribe_local(
             "--parent-pid", str(os.getpid()),
         ]
         print("   🔧 启动本地转录子进程（隔离 GPU 状态，避免崩溃拖垮主流程）...")
+        # Windows：用 job object 保证父进程死亡时 worker 被系统强制回收（比线程看门狗更可靠）
+        kill_job = None
+        creationflags = 0
+        if sys.platform == "win32":
+            try:
+                kill_job = _create_kill_job()
+                if kill_job:
+                    creationflags = subprocess.CREATE_BREAKAWAY_FROM_JOB
+            except Exception:  # noqa: BLE001
+                kill_job = None
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -475,7 +552,19 @@ def _transcribe_local(
             errors="replace",
             cwd=str(project_root),
             env=env,
+            creationflags=creationflags,
         )
+        if kill_job:
+            try:
+                if not _assign_to_job(kill_job, proc.pid):
+                    _kernel32.CloseHandle(kill_job)
+                    kill_job = None
+            except Exception:  # noqa: BLE001
+                try:
+                    _kernel32.CloseHandle(kill_job)
+                except Exception:  # noqa: BLE001
+                    pass
+                kill_job = None
         # 记录活跃 worker，供 atexit / 控制台事件 / 看门狗在退出时强制清理，避免遗留孤儿进程
         _ACTIVE_WORKER = proc
         # 实时转发子进程进度输出（含分块进度），并缓冲用于失败根因分类
@@ -488,6 +577,12 @@ def _transcribe_local(
         rc = proc.wait()
         # 本轮 worker 已结束（成功或失败），清空记录，避免 atexit 误杀已退出的进程
         _ACTIVE_WORKER = None
+        # 关闭 job object；正常退出时 worker 已结束，关闭无害；异常退出时 handle 关闭会触发系统杀 worker
+        if kill_job:
+            try:
+                _kernel32.CloseHandle(kill_job)
+            except Exception:  # noqa: BLE001
+                pass
 
         if rc == 0 and json_path.exists():
             detected_language: Optional[str] = None
@@ -563,7 +658,9 @@ def _transcribe_local(
     raise last_err
 
 
-# OOM / 内存-页面文件类失败信号：命中任一即视为「系统资源不足」，用于早停
+# OOM / 内存-页面文件类失败信号：命中任一即视为「系统资源不足」，用于早停。
+# 注意：STATUS_STACK_BUFFER_OVERRUN / 3221226505 是 Windows fast-fail 原生中止，
+# 常见诱因是 cudnn/CUDA 库版本冲突，不是内存不足，反复重试无意义，故不列入 OOM。
 _OOM_SIGNALS = (
     "WinError 1455",
     "页面文件太小",
@@ -572,8 +669,6 @@ _OOM_SIGNALS = (
     "_ArrayMemoryError",       # numpy 异常类全名中的子串
     "cuBLAS_NOT_SUPPORTED",    # 规范指定：cuBLAS 不支持（显存/算力不足）
     "cuBLAS_STATUS_NOT_SUPPORTED",
-    "STATUS_STACK_BUFFER_OVERRUN",
-    "3221226505",             # Windows 下内存/栈相关的进程退出码
 )
 
 

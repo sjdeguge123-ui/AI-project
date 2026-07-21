@@ -112,6 +112,15 @@ def test_rule_based_punctuate_adds_period():
     assert "田中" in out  # 不丢内容
 
 
+def test_rule_based_punctuate_no_timestamp_also_works():
+    # 用户反馈中文全文常只有开头一个时间戳，fallback 必须也能断句
+    text = "我去监督李大康是来监督上日记你能按照党章的要求和中央的规定对我们成为一把手实际有效的统计监督吗"
+    out = _rule_based_punctuate(text)
+    assert "。" in out
+    assert "，" in out
+    assert "监督" in out  # 不丢内容
+
+
 def test_rule_based_punctuate_keeps_existing_punct():
     text = "[00:00] 你好。世界"
     out = _rule_based_punctuate(text)

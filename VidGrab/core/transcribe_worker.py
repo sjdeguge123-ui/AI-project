@@ -95,11 +95,41 @@ def _start_parent_watchdog(parent_pid: int) -> None:
     threading.Thread(target=_loop, daemon=True).start()
 
 
+def _preload_ctranslate2_cudnn() -> None:
+    """Windows 下优先加载 ctranslate2 自带的 cudnn64_9.dll，避免与 torch 的 cudnn 版本冲突。
+
+    根因：ctranslate2 与 torch 都自带 cudnn64_9.dll 且版本/体积不同；
+    若 torch 的 cudnn 先被加载，ctranslate2 会拿到不兼容版本，触发 STATUS_STACK_BUFFER_OVERRUN
+    （0xC0000409 / 3221226505）原生 fast-fail 中止。通过显式预加载 ctranslate2 的 cudnn，
+    让后续 torch/ctranslate2 使用同一份兼容 DLL。
+    """
+
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        import importlib.util
+        from pathlib import Path
+
+        spec = importlib.util.find_spec("ctranslate2")
+        if not spec or not spec.origin:
+            return
+        cudnn_path = Path(spec.origin).parent / "cudnn64_9.dll"
+        if cudnn_path.exists():
+            ctypes.windll.kernel32.LoadLibraryW(str(cudnn_path))
+    except Exception:  # noqa: BLE001
+        # 预加载失败不阻塞主流程，让正常 import 自己处理
+        pass
+
+
 def main() -> int:
     args = _parse_args()
     if args.parent_pid:
         _start_parent_watchdog(args.parent_pid)
     try:
+        # 在 import ctranslate2 / torch 之前，先预加载 ctranslate2 的 cudnn，
+        # 避免 Windows 因多份 cudnn64_9.dll 版本冲突触发 STATUS_STACK_BUFFER_OVERRUN。
+        _preload_ctranslate2_cudnn()
         # 延迟导入，避免子进程启动就加载重依赖（仅在成功路径需要）
         from core.transcriber import _run_local_transcription
         from core import Segment

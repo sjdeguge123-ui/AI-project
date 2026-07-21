@@ -288,22 +288,90 @@ def _needs_punctuation(text: str) -> bool:
     return not any(ch in _CJK_PUNCT for ch in (text or ""))
 
 
-def _rule_based_punctuate(text: str) -> str:
-    """确定性中文断句兜底：以 [MM:SS] 时间戳为界，每块末尾补句号，避免完全无标点。
+def _punctuate_chinese_chunk(chunk: str) -> str:
+    """对一段无时间戳的中文文本做确定性断句兜底。
 
-    仅在 LLM 补标点失败（限流/网络）时启用，保证全文至少具备句读，
+    策略（保守、不动字、只插标点）：
+    1. 在常见句末/停顿语气词后插逗号（若后面不是标点）。
+    2. 在长句中遇到常见句首词（我/你/他/这/那/现在/当时/最后 等）前插句号，
+       限制单句长度，避免一逗到底。
+    3. 段末强制补句号。
+
+    这是 LLM 失败时的 best-effort，不完美但能把「一堵墙」拆成可读句读。
+    """
+    import re
+
+    if not chunk:
+        return chunk
+
+    # 1) 语气词/助词后插逗号（常见口语停顿），不跟在任何 CJK 标点/空白后。
+    #    注意：不插「的/了」，否则会在每个「的/了」后都断，过度碎片化。
+    particles = ["就是了", "而已", "罢了", "呢", "吗", "啊", "吧", "嘛", "哦", "嗯", "唉", "哎", "哟", "哈", "嘿"]
+    particles.sort(key=len, reverse=True)
+    particles_pat = "|".join(re.escape(p) for p in particles)
+    chunk = re.sub(
+        rf"({particles_pat})(?![\s，。、；：！？“”‘’（）《》—…·])",
+        r"\1，",
+        chunk,
+    )
+
+    # 2) 句首词前插句号，把超长段落切开；用显式遍历避免变长 look-behind 不支持
+    starters = [
+        "总而言之", "总的来说", "综上所述", "事实上", "实际上",
+        "我们", "你们", "他们", "她们", "它们",
+        "这个", "那个", "这里", "那里", "这边", "那边",
+        "首先", "其次", "再次", "接着", "然后", "于是", "因此", "所以", "但是", "可是", "不过",
+        "其实", "总之", "现在", "当时", "后来", "最后",
+        "我", "你", "他", "她", "它",
+    ]
+    starters.sort(key=len, reverse=True)
+
+    cjk_punct = set("，。、；：！？“”‘’（）《》—…· \t\n\r")
+    result: List[str] = []
+    last_punct_pos = -20  # 允许开头句首词前不插句号
+    i = 0
+    while i < len(chunk):
+        matched = False
+        for st in starters:
+            if chunk.startswith(st, i):
+                pos = len(result)
+                if pos - last_punct_pos >= 20 and i > 0 and chunk[i - 1] not in cjk_punct:
+                    result.append("。")
+                    last_punct_pos = pos + 1
+                result.append(st)
+                i += len(st)
+                matched = True
+                break
+        if matched:
+            continue
+        ch = chunk[i]
+        result.append(ch)
+        if ch in cjk_punct:
+            last_punct_pos = len(result)
+        i += 1
+
+    # 3) 段末强制句号
+    out = "".join(result).rstrip()
+    if out and out[-1] not in "。！？…":
+        out += "。"
+    return out
+
+
+def _rule_based_punctuate(text: str) -> str:
+    """确定性中文断句兜底：以 [MM:SS] 时间戳为界，每块内再用规则切分句读。
+
+    仅在 LLM 补标点失败（限流/网络）时启用，保证全文至少具备逗号/句号，
     不依赖外部服务，绝不丢内容、不动时间戳。
     """
     import re
 
     parts = re.split(r"(\[[\d:]+\])", text)
-    out = parts[0] if parts else ""
+    out = _punctuate_chinese_chunk(parts[0]) if parts else ""
     i = 1
     while i < len(parts):
         ts = parts[i]
         chunk = (parts[i + 1] if i + 1 < len(parts) else "").rstrip()
-        if chunk and chunk[-1] not in "。！？…":
-            chunk = chunk + "。"
+        chunk = _punctuate_chinese_chunk(chunk)
         out += ts + chunk
         i += 2
     return out
@@ -346,7 +414,8 @@ def _restore_punctuation(text: str, client, ai: AIConfig, proxy: str = "") -> st
                 max_tokens=max(len(text) * 2, 2048),
             )
             result = _raw_content(raw).strip()
-            if result:
+            # 校验：LLM 必须真的补了标点，否则视为失败走兜底
+            if result and not _needs_punctuation(result):
                 return result
         except Exception as e:  # noqa: BLE001
             err = str(e)
@@ -455,7 +524,9 @@ def _build_full_text(segments: List[Segment], interval_sec: int = 180, max_chars
     中文视频：对每段文本做繁简转换，确保输出为简体中文（B站常见繁体/台湾字幕）。
     """
 
-    is_zh = (lang or _detect_language(segments)) == "zh"
+    # lang 本身可能是 faster-whisper 误判的 non-zh，必须再用文本校验，
+    # 否则中文 ASR 结果会被跳过繁简转换与标点恢复。
+    is_zh = lang == "zh" or _detect_language(segments) == "zh"
     buf: List[str] = []
     last_ts = -1e9
     chars = 0
@@ -563,8 +634,12 @@ def generate_summary(
     if ai.tier == "free":
         rate_limiter.notify_if_free()
 
-    # 输出语言跟随视频语种；若 transcript.language 为空/未知，按实际文本重新判定
-    detected_lang = transcript.language or _detect_language(transcript.segments)
+    # 输出语言跟随视频语种；若 transcript.language 为空/未知或被误判，按实际文本重新判定
+    # 注意：不要因 transcript.language 非空就短路， faster-whisper 可能把中文 ASR 判成 en/ja，
+    # 导致后续中文标点、繁简、摘要语言全部错误（issue：中文全文无标点根因之一）。
+    detected_lang = transcript.language or ""
+    if detected_lang != "zh":
+        detected_lang = _detect_language(transcript.segments) or detected_lang
     if not detected_lang and transcript.segments:
         detected_lang = "en"  # 非空但无 CJK 时，默认英文更合理（避免模型默认中文）
     lang_inst = _language_instruction(detected_lang)
@@ -573,8 +648,8 @@ def generate_summary(
     if mode == "fulltext":
         full_text = _build_full_text(transcript.segments, lang=transcript.language or "")
         # 统一语种判断：与 _build_full_text 的 is_zh 口径一致，
-        # 避免 transcript.language 为空但文本中文时只繁简不补标点（问题1潜在项）
-        is_zh = (transcript.language or _detect_language(transcript.segments)) == "zh"
+        # 且当 faster-whisper 误判为非 zh 时仍按文本重新判定，确保中文标点/繁简不丢失。
+        is_zh = transcript.language == "zh" or _detect_language(transcript.segments) == "zh"
         if is_zh:
             full_text = _restore_punctuation(full_text, client, ai, proxy)
         try:
