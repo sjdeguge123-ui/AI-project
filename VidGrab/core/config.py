@@ -50,7 +50,7 @@ class WhisperConfig:
     mode: str = "api"          # api（云端）| local（本地）
     api_key: str = ""          # api 模式填 OpenAI Key
     local_model: str = "base"  # local 模式模型大小
-    device: str = "cpu"        # cpu（默认，规避 Windows GPU 页面文件不稳定）| auto（自动检测）| cuda
+    device: str = "auto"       # auto（自动检测GPU，优先GPU，失败自动回退CPU）| cpu | cuda
     compute_type: str = "auto" # auto（GPU默认int8_float16/CPU默认int8）| float16 | int8 | int8_float16
     language: str = "auto"     # auto（跟随视频/自动检测）| zh | en；透传给 ASR 以锁定语种与标点
 
