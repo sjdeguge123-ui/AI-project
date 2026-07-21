@@ -62,6 +62,38 @@ def test_map_bili_lang_empty():
     assert _map_bili_lang("", "中文") == ""
 
 
+# ── 1b. B站 AI 机翻字幕（ai-ja/ai-es/ai-ar 等）语种码识别（2026-07-21 二次反馈）──
+
+def test_map_bili_lang_ai_ja():
+    # ai-ja + 日文 → 应识别为 ja（不再返回 "" 触发文本回退）
+    assert _map_bili_lang("ai-ja", "こんにちは世界") == "ja"
+
+
+def test_map_bili_lang_ai_es_is_not_en():
+    # 关键回归：ai-es 必须识别为 es，绝不能回退成 en（检测器对拉丁文种不可靠）
+    assert _map_bili_lang("ai-es", "Hola mundo este es un video de prueba") == "es"
+
+
+def test_map_bili_lang_ai_ar_is_not_en():
+    # 关键回归：ai-ar 必须识别为 ar，绝不能回退成 en
+    assert _map_bili_lang("ai-ar", "مرحبا بالعالم هذا فيديو للاختبار") == "ar"
+
+
+def test_map_bili_lang_ai_ja_but_chinese_text_falls_to_zh():
+    # ai-ja 元数据 + 纯中文文本 → 交叉校验回落 zh（与 ko/ja 纠偏一致）
+    assert _map_bili_lang("ai-ja", "这是一段纯中文内容用于测试语种交叉校验逻辑") == "zh"
+
+
+def test_map_bili_lang_ai_ko_and_ai_en():
+    assert _map_bili_lang("ai-ko", "안녕하세요 세계") == "ko"
+    assert _map_bili_lang("ai-en", "Hello world this is a test") == "en"
+
+
+def test_map_bili_lang_ai_unknown_suffix_no_crash():
+    # 未知后缀不抛异常，返回 "" 交由上层回退
+    assert _map_bili_lang("ai-xx", "") == ""
+
+
 # ───────────────────────── 2. _choose_subtitle 选择策略 ─────────────────────────
 
 def test_choose_subtitle_original_prefers_non_zh():
@@ -197,6 +229,20 @@ def test_restore_punctuation_fallback_on_sparse_llm_result():
     # LLM 稀疏标点应被判定为失败，走规则兜底
     assert "。" in out
     # 规则兜底会在段末加句号，且应比 LLM 仅加一个逗号密度更高
+    assert _punctuation_density(out) > 0.003
+
+
+def test_restore_punctuation_booktitle_triggers_restore():
+    # 回归：长中文 ASR 文本仅含单个《》符号（存在性守卫旧逻辑会误判「已标点」而跳过），
+    # 改用密度守卫后必须进入标点恢复，LLM 稀疏结果触发规则兜底，最终产出足够标点。
+    cfg = AIConfig()
+    base = "今天我们来聊一聊这个话题内容非常多但是完全没有标点符号读起来很累" * 100
+    text = "[00:00] " + base + "《书名》"  # 仅 2 个 CJK 标点，密度远低于 0.003
+    out = _restore_punctuation(text, _SparsePunctClient(), cfg, "")
+    # 不应被存在性守卫直接放行（旧 bug 会原样返回无标点文本）
+    assert out != text
+    # 规则兜底必须补上逗号/句号
+    assert "。" in out or "，" in out
     assert _punctuation_density(out) > 0.003
 
 
