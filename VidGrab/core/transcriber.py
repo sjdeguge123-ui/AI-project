@@ -15,8 +15,11 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
+import subprocess
+import sys
 import time as _time
 from pathlib import Path
 from typing import List, Optional
@@ -109,15 +112,42 @@ def _transcribe_api(audio_path: Path, api_key: str) -> List[Segment]:
     return segments
 
 
-def _transcribe_local(audio_path: Path, model_size: str, device: str = "auto", compute_type: str = "auto") -> List[Segment]:
-    """本地 faster-whisper 推理。默认自动检测 GPU（优先 GPU），无 GPU 回退 CPU 并提醒。
+def _load_whisper_model(model_path, device, compute_type, max_attempts: int = 3):
+    """加载 WhisperModel，对瞬时内存分配失败（mkl_malloc / CUDA OOM）做有限重试。
+
+    Windows 下 MKL / CUDA 的瞬时分配失败具有偶发性（空闲内存充足也会因碎片化失败），
+    重试通常能成功，避免「时好时坏、刚修好又崩」。返回模型对象；若全部重试失败则返回
+    最后一个异常对象（调用方据此判断是否需要回退 CPU 或报错）。
+    """
+
+    from faster_whisper import WhisperModel
+
+    last_exc = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return WhisperModel(model_path, device=device, compute_type=compute_type)
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if attempt < max_attempts:
+                print(f"   ⚠️ 模型加载失败（第 {attempt}/{max_attempts} 次，疑似瞬时内存分配失败），3 秒后重试...")
+                _time.sleep(3)
+    return last_exc
+
+
+def _run_local_transcription(audio_path: Path, model_size: str, device: str = "auto", compute_type: str = "auto") -> List[Segment]:
+    """本地 faster-whisper 推理（实际执行体，运行在隔离子进程内）。
 
     device: auto（自动检测）| cpu | cuda
     compute_type: auto（GPU 默认 int8_float16，CPU 默认 int8）| float16 | int8 | int8_float16
+
+    注意：此函数被 core/transcribe_worker.py 在独立子进程中调用，目的是把 GPU/CUDA
+    状态完全隔离，避免 Windows 下 CTranslate2 模型析构时硬崩溃拖垮主流程。
     """
 
     from faster_whisper import WhisperModel
     import ctranslate2
+
+    audio_path = Path(audio_path)
 
     # 优先用本地模型目录（绕过 HuggingFace 下载，适合代理 SSL 受限环境）
     local_dir = Path(__file__).parent.parent / "models" / f"faster-whisper-{model_size}"
@@ -158,21 +188,20 @@ def _transcribe_local(audio_path: Path, model_size: str, device: str = "auto", c
         print(f"   🌐 首次运行需从 HuggingFace 下载 faster-whisper-{model_size} 模型，请保持网络畅通...")
 
     print("   ⏳ 正在加载 faster-whisper 模型...")
-    try:
-        model = WhisperModel(model_path, device=use_device, compute_type=use_compute_type)
-    except Exception as exc:  # noqa: BLE001
-        # GPU 加载失败（OOM、CUDA 版本不匹配、驱动问题等）时，尝试 CPU 兜底
+    model = _load_whisper_model(model_path, use_device, use_compute_type)
+    if isinstance(model, Exception):
+        # 主设备（cuda）加载失败 → 回退 CPU 再重试
         if use_device == "cuda":
-            print(f"   ⚠️ GPU 加载失败：{exc}")
+            print(f"   ⚠️ GPU 加载失败：{model}")
             print("   🔄 自动回退到 CPU 转录（可在 config.yaml 将 whisper.device 设为 cpu 永久使用）...")
             use_device, use_compute_type = "cpu", "int8"
-            model = WhisperModel(model_path, device=use_device, compute_type=use_compute_type)
-        else:
+            model = _load_whisper_model(model_path, use_device, use_compute_type)
+        if isinstance(model, Exception):
             raise RuntimeError(
-                f"加载 faster-whisper 模型失败：{exc}\n"
-                "常见原因：① 模型文件损坏/缺失 ② 网络问题导致下载失败 ③ 内存/显存不足。\n"
+                f"加载 faster-whisper 模型失败：{model}\n"
+                "常见原因：① 模型文件损坏/缺失 ② 网络问题导致下载失败 ③ 内存/显存不足（瞬时分配失败已重试）。\n"
                 "建议：检查网络、确认模型目录完整，或改用云端模式（whisper.mode: api）。"
-            ) from exc
+            ) from model
 
     # 预先把音频转成 16kHz mono WAV，避免 faster-whisper 内部读取/重采样时触发端崩溃
     wav_path = _ensure_wav_16k_mono(audio_path)
@@ -185,78 +214,163 @@ def _transcribe_local(audio_path: Path, model_size: str, device: str = "auto", c
     # 每块特征数组只有几分钟大小（峰值降两个数量级），并按块起点偏移拼接时间戳。
     print("   🎙️ 开始转录，请稍候（长音频自动分块，期间会显示进度）...")
     segments = _transcribe_chunked(model, wav_path)
-    print(f"   ✅ 转录完成：{len(segments)} 段文字")
     return segments
 
 
-# 单块时长（秒）：5 分钟。足够小以规避大额连续内存分配，又不至于块数过多。
-_CHUNK_SEC = 300
+def _transcribe_local(audio_path: Path, model_size: str, device: str = "auto", compute_type: str = "auto") -> List[Segment]:
+    """本地 faster-whisper 转录（子进程隔离版）。
+
+    把 GPU/CUDA 重活放进独立子进程（core/transcribe_worker.py），子进程退出时 CUDA 状态
+    随之一并销毁，主流程继续 AI 摘要，彻底规避 Windows 下 CTranslate2 模型析构时的硬崩溃
+    （表现为「转录完成却忽然回到提示符、无任何报错」）。
+    """
+
+    audio_path = Path(audio_path)
+    json_path = audio_path.with_suffix(".segments.json")
+    project_root = Path(__file__).parent.parent
+
+    cmd = [
+        sys.executable, "-u", "-m", "core.transcribe_worker",
+        "--audio-path", str(audio_path),
+        "--model-size", str(model_size),
+        "--device", str(device),
+        "--compute-type", str(compute_type),
+        "--output-json", str(json_path),
+    ]
+
+    max_runs = 2  # 子进程级重试：覆盖转录过程中偶发的瞬时分配失败
+    last_err: Optional[Exception] = None
+    for run_i in range(1, max_runs + 1):
+        if run_i > 1:
+            print(f"   🔁 重试本地转录子进程（第 {run_i}/{max_runs} 次）...")
+        print("   🔧 启动本地转录子进程（隔离 GPU 状态，避免崩溃拖垮主流程）...")
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            encoding="utf-8",
+            errors="replace",
+            cwd=str(project_root),
+        )
+        # 实时转发子进程进度输出（含分块进度），保持用户可见
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            print(line.rstrip("\n"))
+        rc = proc.wait()
+
+        if rc == 0 and json_path.exists():
+            try:
+                with open(json_path, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
+                segments = [
+                    Segment(start=float(d["start"]), end=float(d["end"]), text=str(d["text"]))
+                    for d in raw
+                ]
+            finally:
+                try:
+                    json_path.unlink()
+                except Exception:  # noqa: BLE001
+                    pass
+            return segments
+
+        # 失败：记录错误，准备重试
+        last_err = RuntimeError(
+            f"本地转录子进程异常退出（exit code={rc}）。\n"
+            "常见原因：① 模型加载/GPU 崩溃（瞬时内存分配失败）② 音频文件损坏 ③ 依赖缺失。\n"
+            "建议：在 config.yaml 设置 whisper.device: cpu 或 whisper.compute_type: int8，"
+            "或改用 whisper.mode: api 云端转录。"
+        )
+        # 清理可能残留的 json
+        try:
+            json_path.unlink()
+        except Exception:  # noqa: BLE001
+            pass
+        _time.sleep(2)
+
+    # 全部重试失败
+    raise last_err
+
+
+# 单块时长（秒）：2 分钟。足够小以规避大额连续内存分配（decode_audio 整段 123MB /
+# STFT 整段数百 MB），又不至于块数过多。配合 wave 按块读取，峰值内存恒定在几十 MB。
+_CHUNK_SEC = 120
 _SAMPLE_RATE = 16000
 
 
 def _transcribe_chunked(model, wav_path: Path) -> List[Segment]:
-    """把音频解码成 numpy，按固定时长切片逐块转录，拼接时间戳。
+    """按固定时长用标准库 wave 分块读取 PCM 并逐块转录，拼接时间戳。
 
-    为什么这样能根治 OOM：faster-whisper 的 feature_extractor 会对「喂进来的整段音频」
-    一次性做 STFT。传文件路径 = 整段一起算，长视频峰值内存爆炸；传「切好的短数组」=
-    每次只算几分钟，峰值内存恒定在几十 MB，无论视频多长都稳定。
+    为什么必须按块「流式」读取，而不是 decode_audio 整段解码：
+    faster-whisper 的 feature_extractor 会对「喂进来的整段音频」一次性做 STFT；而
+    faster_whisper.audio.decode_audio 又先把整段音频解码成一个连续大数组。长视频(30min+)
+    下，这两个「整段」操作都需要上百 MB 的【连续】主机内存，空闲内存波动/碎片化时会
+    间歇性抛 numpy ArrayMemoryError（表现为「时好时坏、转录后自己结束」）。
+
+    改为：直接用标准库 wave 按块读取 16k mono PCM（每 2 分钟仅约 2-4MB），转 float32 后
+    逐块喂给 model.transcribe()，每次只处理几分钟，峰值内存恒定在几十 MB，无论视频多长都稳定。
     """
 
     import numpy as np
-    from faster_whisper.audio import decode_audio
+    import wave
 
-    try:
-        audio = decode_audio(str(wav_path), sampling_rate=_SAMPLE_RATE)
-    except Exception as exc:  # noqa: BLE001
-        raise RuntimeError(
-            f"音频解码失败：{exc}\n"
-            "常见原因：① 音频文件损坏 ② ffmpeg 不可用。\n"
-            "建议：确认 ffmpeg 可用（本工具内置 imageio-ffmpeg），或改用 whisper.mode: api 云端转录。"
-        ) from exc
-
-    audio = np.asarray(audio, dtype="float32")
-    total_samples = int(audio.shape[0])
-    total_dur = total_samples / _SAMPLE_RATE
-    chunk_samples = _CHUNK_SEC * _SAMPLE_RATE
-    n_chunks = max(1, (total_samples + chunk_samples - 1) // chunk_samples)
-
-    segments: List[Segment] = []
-    _last_log = _time.time()
-    _count = 0
-    for ci in range(n_chunks):
-        s0 = ci * chunk_samples
-        s1 = min(total_samples, s0 + chunk_samples)
-        offset = s0 / _SAMPLE_RATE  # 该块在整段音频中的起始秒数，用于还原全局时间戳
-        clip = audio[s0:s1]
-        try:
-            seg_gen, _info = model.transcribe(clip, beam_size=5, word_timestamps=False)
-        except Exception as exc:  # noqa: BLE001
+    with wave.open(str(wav_path), "rb") as wf:
+        fr = wf.getframerate()
+        nch = wf.getnchannels()
+        sw = wf.getsampwidth()
+        nframes = wf.getnframes()
+        if fr != _SAMPLE_RATE or nch != 1 or sw != 2:
             raise RuntimeError(
-                f"faster-whisper 转录过程出错（第 {ci + 1}/{n_chunks} 块）：{exc}\n"
-                "常见原因：① 音频文件损坏 ② 内存/显存异常 ③ 模型与硬件不匹配。\n"
-                "建议：尝试在 config.yaml 设置 whisper.device: cpu 或 whisper.compute_type: int8，\n"
-                "      或改用 whisper.mode: api 云端转录。"
-            ) from exc
+                f"音频不是预期的 16k mono 16bit PCM（fr={fr}, nch={nch}, sw={sw}），"
+                "请检查 _ensure_wav_16k_mono 是否生效，或改用 whisper.mode: api 云端转录。"
+            )
 
-        for seg in seg_gen:
-            text = (seg.text or "").strip()
-            if text:
-                segments.append(
-                    Segment(start=float(seg.start) + offset, end=float(seg.end) + offset, text=text)
-                )
-            _count += 1
-            _now = _time.time()
-            if _now - _last_log >= 15:
-                _last_log = _now
-                cur = (seg.end or 0) + offset
-                _pct = int(cur / total_dur * 100) if total_dur else 0
-                _pct = max(0, min(100, _pct))
-                print(f"   ⏳ 转录进度：{_fmt_ts(cur)} / {_fmt_ts(total_dur)}（{_pct}%，已 {_count} 段，块 {ci + 1}/{n_chunks}）")
+        chunk_frames = _CHUNK_SEC * fr
+        total_dur = nframes / fr
+        n_chunks = max(1, (nframes + chunk_frames - 1) // chunk_frames)
 
-        # 每块结束打印一次，让用户看到分块推进
-        done_dur = s1 / _SAMPLE_RATE
-        _dpct = int(done_dur / total_dur * 100) if total_dur else 100
-        print(f"   ✅ 已完成第 {ci + 1}/{n_chunks} 块（累计 {_fmt_ts(done_dur)} / {_fmt_ts(total_dur)}，{_dpct}%）")
+        segments: List[Segment] = []
+        _last_log = _time.time()
+        _count = 0
+        for ci in range(n_chunks):
+            s0 = ci * chunk_frames
+            s1 = min(nframes, s0 + chunk_frames)
+            offset = s0 / fr  # 该块在整段音频中的起始秒数，用于还原全局时间戳
+            raw = wf.readframes(s1 - s0)
+            if not raw:
+                break
+            # int16 PCM -> float32 in [-1, 1]（只读这一小块，约几 MB，绝不整段分配）
+            audio_chunk = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+            try:
+                seg_gen, _info = model.transcribe(audio_chunk, beam_size=5, word_timestamps=False)
+            except Exception as exc:  # noqa: BLE001
+                raise RuntimeError(
+                    f"faster-whisper 转录过程出错（第 {ci + 1}/{n_chunks} 块）：{exc}\n"
+                    "常见原因：① 音频文件损坏 ② 内存/显存异常 ③ 模型与硬件不匹配。\n"
+                    "建议：尝试在 config.yaml 设置 whisper.device: cpu 或 whisper.compute_type: int8，\n"
+                    "      或改用 whisper.mode: api 云端转录。"
+                ) from exc
+
+            for seg in seg_gen:
+                text = (seg.text or "").strip()
+                if text:
+                    segments.append(
+                        Segment(start=float(seg.start) + offset, end=float(seg.end) + offset, text=text)
+                    )
+                _count += 1
+                _now = _time.time()
+                if _now - _last_log >= 15:
+                    _last_log = _now
+                    cur = (seg.end or 0) + offset
+                    _pct = int(cur / total_dur * 100) if total_dur else 0
+                    _pct = max(0, min(100, _pct))
+                    print(f"   ⏳ 转录进度：{_fmt_ts(cur)} / {_fmt_ts(total_dur)}（{_pct}%，已 {_count} 段，块 {ci + 1}/{n_chunks}）")
+
+            # 每块结束打印一次，让用户看到分块推进
+            done_dur = s1 / fr
+            _dpct = int(done_dur / total_dur * 100) if total_dur else 100
+            print(f"   ✅ 已完成第 {ci + 1}/{n_chunks} 块（累计 {_fmt_ts(done_dur)} / {_fmt_ts(total_dur)}，{_dpct}%）")
 
     return segments
 
