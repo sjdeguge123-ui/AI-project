@@ -288,6 +288,26 @@ def _needs_punctuation(text: str) -> bool:
     return not any(ch in _CJK_PUNCT for ch in (text or ""))
 
 
+def _punctuation_density(text: str) -> float:
+    """CJK 标点密度 = 标点字符数 / 总字符数。"""
+
+    if not text:
+        return 0.0
+    return sum(1 for ch in text if ch in _CJK_PUNCT) / max(1, len(text))
+
+
+def _is_well_punctuated(text: str, min_density: float = 0.003) -> bool:
+    """判定文本是否已有「足够」的中文标点（而非仅有 1 个标点蒙混过关）。
+
+    经验阈值 0.003：1000 字至少 3 个标点，3000 字至少 9 个标点。
+    低于此阈值认为 LLM 补标点失败，改用确定性规则兜底。
+    """
+
+    if _needs_punctuation(text):
+        return False
+    return _punctuation_density(text) >= min_density
+
+
 def _punctuate_chinese_chunk(chunk: str) -> str:
     """对一段无时间戳的中文文本做确定性断句兜底。
 
@@ -414,8 +434,11 @@ def _restore_punctuation(text: str, client, ai: AIConfig, proxy: str = "") -> st
                 max_tokens=max(len(text) * 2, 2048),
             )
             result = _raw_content(raw).strip()
-            # 校验：LLM 必须真的补了标点，否则视为失败走兜底
-            if result and not _needs_punctuation(result):
+            # 校验：LLM 必须真的补了足够密度的标点，否则视为失败走规则兜底。
+            # 避免 LLM 只加 1 个逗号就返回，导致用户仍看到「一堵墙」无标点文本。
+            if result and _is_well_punctuated(result):
+                density = _punctuation_density(result)
+                print(f"   [标点恢复] LLM 补标点成功（标点密度 {density:.4f}）")
                 return result
         except Exception as e:  # noqa: BLE001
             err = str(e)
@@ -424,8 +447,10 @@ def _restore_punctuation(text: str, client, ai: AIConfig, proxy: str = "") -> st
 
                 time.sleep((attempt + 1) * 5)
                 continue
+            print(f"   [标点恢复] LLM 调用失败：{err[:120]}")
             break  # 非限流错误，直接走兜底
     # 兜底：确定性规则断句，保证至少有标点
+    print("   [标点恢复] LLM 标点密度不足或调用失败，改用确定性规则兜底断句")
     return _rule_based_punctuate(text)
 
 
@@ -650,6 +675,10 @@ def generate_summary(
         # 统一语种判断：与 _build_full_text 的 is_zh 口径一致，
         # 且当 faster-whisper 误判为非 zh 时仍按文本重新判定，确保中文标点/繁简不丢失。
         is_zh = transcript.language == "zh" or _detect_language(transcript.segments) == "zh"
+        print(
+            f"   [全文文案] 转录语种={transcript.language or '未识别'}，"
+            f"文本校验={'中文' if is_zh else '非中文'}{'' if is_zh else '（跳过中文标点恢复）'}"
+        )
         if is_zh:
             full_text = _restore_punctuation(full_text, client, ai, proxy)
         try:

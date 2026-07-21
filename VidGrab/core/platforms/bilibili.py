@@ -337,7 +337,8 @@ def _fetch_bilibili_subtitle(
     if degraded:
         print(
             "[bilibili] 未找到原语种字幕，已降级使用中文（可能为机翻）字幕；"
-            "如需原语种，请确认该视频是否提供了原语言字幕。"
+            "如需原语种，请确认该视频是否提供了原语言字幕，"
+            "或使用 --audio 强制音频转录（会下载音轨并用 faster-whisper 识别真实语种）。"
         )
     url = chosen.get("subtitle_url") or chosen.get("url")
     if not url:

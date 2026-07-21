@@ -16,7 +16,7 @@ if str(ROOT) not in sys.path:
 
 from core.lang import _map_bili_lang, _detect_language  # noqa: E402
 from core.platforms.bilibili import _choose_subtitle, _is_machine_translation  # noqa: E402
-from core.summarizer import _restore_punctuation, _rule_based_punctuate  # noqa: E402
+from core.summarizer import _restore_punctuation, _rule_based_punctuate, _is_well_punctuated, _punctuation_density  # noqa: E402
 from core.config import AIConfig  # noqa: E402
 
 
@@ -151,6 +151,53 @@ def test_restore_punctuation_no_punct_needed_passthrough():
     text = "[00:00] 你好。世界！"
     out = _restore_punctuation(text, _FailingClient(), cfg, "")
     assert out == text
+
+
+# ───────────────────────── 4. LLM 稀疏标点兜底（2026-07-21 回归加固）─────────────────────────
+
+def test_is_well_punctuated_rejects_sparse_punctuation():
+    # 1000 字里只有 1 个逗号 = 密度不足，应视为未补标点
+    sparse = "a" * 1000 + "，"
+    assert not _is_well_punctuated(sparse)
+    # 1000 字里 5 个标点 = 密度足够
+    dense = "a" * 1000 + "，。，。，"
+    assert _is_well_punctuated(dense)
+
+
+class _SparsePunctClient:
+    """模拟 LLM 只加了 1 个逗号就返回（稀疏标点），应触发规则兜底。"""
+
+    class _Completions:
+        class _WithRaw:
+            def __init__(self, content):
+                self.content = content
+                self.headers = {}
+            def parse(self):
+                class _Msg:
+                    content = self.content
+                class _Choice:
+                    message = _Msg()
+                class _Completion:
+                    choices = [_Choice()]
+                return _Completion()
+        def with_raw_response(self):
+            return self
+        def create(self, **kwargs):
+            user = kwargs.get("messages", [])[1]["content"]
+            # LLM 只加一个逗号（密度远低于 0.003）
+            return self._WithRaw(user + "，")
+
+    chat = _Completions()
+
+
+def test_restore_punctuation_fallback_on_sparse_llm_result():
+    cfg = AIConfig()
+    text = "[00:00] 大家好我是田中最近日本非常热"
+    out = _restore_punctuation(text, _SparsePunctClient(), cfg, "")
+    # LLM 稀疏标点应被判定为失败，走规则兜底
+    assert "。" in out
+    # 规则兜底会在段末加句号，且应比 LLM 仅加一个逗号密度更高
+    assert _punctuation_density(out) > 0.003
 
 
 if __name__ == "__main__":

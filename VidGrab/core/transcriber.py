@@ -477,12 +477,16 @@ def _transcribe_local(
     use_device = device
     use_compute_type = compute_type
     use_chunk_sec = 120  # GPU/CPU 统一 120 秒固定块长（续传边界一致；小块不缓解 MKL 加载期分配）
+    prev_rc: Optional[int] = None
+    prev_child_text = ""
     for run_i in range(1, max_runs + 1):
         if run_i > 1:
             print(f"   🔁 重试本地转录子进程（第 {run_i}/{max_runs} 次）...")
             # 若前一次走 GPU 路径硬崩溃，重试强制 CPU（牺牲速度换稳定）
             if run_i == 2 and use_device in ("auto", "cuda"):
-                print("   🖥️ GPU 路径已崩溃，重试改用 CPU（更稳定，速度较慢）...")
+                crash_reason = _classify_worker_exit(prev_rc, prev_child_text)
+                print(f"   🖥️ GPU 路径已崩溃（exit code={prev_rc}），{crash_reason}")
+                print("   🔄 已自动改用 CPU（更稳定，速度较慢）并从断点续传，主流程不受影响。")
                 use_device = "cpu"
                 use_compute_type = "int8"
                 use_chunk_sec = 120
@@ -575,6 +579,8 @@ def _transcribe_local(
             print(s)
             child_log.append(s)
         rc = proc.wait()
+        prev_rc = rc
+        prev_child_text = "\n".join(child_log)
         # 本轮 worker 已结束（成功或失败），清空记录，避免 atexit 误杀已退出的进程
         _ACTIVE_WORKER = None
         # 关闭 job object；正常退出时 worker 已结束，关闭无害；异常退出时 handle 关闭会触发系统杀 worker
@@ -675,6 +681,33 @@ _OOM_SIGNALS = (
 def _is_oom_failure(text: str) -> bool:
     """判断子进程失败输出是否属于内存/页面文件不足类（OOM）。"""
     return any(sig in text for sig in _OOM_SIGNALS)
+
+
+def _classify_worker_exit(rc: Optional[int], child_text: str) -> str:
+    """把 worker 退出码/输出归类为易懂原因，用于 GPU 崩溃时给用户明确解释。"""
+
+    text = child_text or ""
+    # Windows fast-fail：cudnn / CUDA 库冲突（本轮核心根因）
+    if rc == 3221226505 or "STATUS_STACK_BUFFER_OVERRUN" in text or "0xC0000409" in text:
+        return (
+            "Windows 原生 fast-fail（STATUS_STACK_BUFFER_OVERRUN / 0xC0000409）："
+            "ctranslate2 与 torch 的 cudnn 版本冲突。代码已注入 cudnn 预加载，"
+            "若仍出现请重启电脑并确认虚拟内存（页面文件）充足。"
+        )
+    if "WinError 1455" in text or "页面文件太小" in text:
+        return (
+            "Windows 页面文件不足（WinError 1455）：CUDA 库加载时提交内存超过上限。"
+            "建议把虚拟内存调到物理内存的 1.5–2 倍并重启，或改用 whisper.mode: api 云端转录。"
+        )
+    if "mkl_malloc" in text or "ArrayMemoryError" in text or "_ArrayMemoryError" in text:
+        return "内存分配失败（MKL/numpy 瞬时分配不足），已自动改用 CPU 并续传。"
+    if "cuBLAS_NOT_SUPPORTED" in text or "cuBLAS_STATUS_NOT_SUPPORTED" in text:
+        return "cuBLAS 不支持当前显存/算力配置，已自动改用 CPU 并续传。"
+    if rc is not None and rc < 0:
+        return f"子进程被信号终止（exit code={rc}），已自动改用 CPU 并续传。"
+    if rc == 0:
+        return "子进程正常退出但输出文件缺失，已重试。"
+    return f"子进程异常退出（exit code={rc}），已自动改用 CPU 并从断点续传。"
 
 
 def _read_worker_lang(json_path: Path) -> Optional[str]:
