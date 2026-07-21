@@ -26,14 +26,15 @@ ai:
 # mode: local（本地 faster-whisper，免费、免 Key、需本机装 ffmpeg+模型）
 #       api  （云端 Whisper，按分钟收费，需 OpenAI Key）
 # local_model: tiny / base / small / medium（越大越准越慢）
-# device: auto（自动检测，有 GPU 用 GPU、无 GPU 回退 CPU 并提醒）/ cpu / cuda
+# device: cpu（默认，最稳；Windows 页面文件不足时 GPU 会 WinError 1455）/ auto / cuda
+#           想启用 GPU 加速可改为 cuda 或 auto（有 GPU 自动用 GPU）
 # compute_type: auto（默认，GPU 用 int8_float16 稳且快，CPU 用 int8）/ float16 / int8 / int8_float16
 #               若 GPU 转录闪退，可显式设为 int8 或改 device: cpu
 whisper:
   mode: local
   api_key: ""
   local_model: "base"
-  device: "auto"
+  device: "cpu"
   compute_type: "auto"
 
 # 输出配置

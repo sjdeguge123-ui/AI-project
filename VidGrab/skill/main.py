@@ -452,12 +452,8 @@ def _offer_other_versions(t, cfg, proxy: str, formats: list, first_mode: str, fi
         print(f"\n💡 {head}已导出一版，是否还要其他版本？")
         print("   1. 精简   2. 详细   3. 自定义（关键词）   4. 全文文案   5. 不需要了，退出")
         try:
-            prompt = (
-                f"《{title}》请选择（1-5，默认 5 退出；100 秒无操作自动退出）："
-                if title else
-                "请选择（1-5，默认 5 退出；100 秒无操作自动退出）："
-            )
-            choice = _timed_input(prompt, timeout=100)
+            # 标题已在上方 💡 行展示，输入提示不再重复，避免冗余
+            choice = _timed_input("请选择（1-5，默认 5 退出；100 秒无操作自动退出）：", timeout=100)
         except TimeoutError:
             print("\n⏰ 100 秒未操作，自动退出。中间临时文件将在程序结束时清理。")
             return

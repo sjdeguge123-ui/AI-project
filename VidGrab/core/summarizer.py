@@ -44,7 +44,7 @@ _CHUNK_SYSTEM_PROMPT = """{language_instruction}
 }}
 
 要求：
-- 全部用简体中文。
+- {language_instruction}（不要输出其他语言）。
 - **按内容逻辑分章**：同一话题合并成一章，不同话题分开成不同章；不要按固定时间间隔（如每 1 分钟一行）平铺。**尽量合并同类话题，章节越少越好，但不要遗漏关键内容**。
 {mode_instruction}
 {query_instruction}
@@ -72,7 +72,7 @@ _MERGE_SYSTEM_PROMPT = """{language_instruction}
 }}
 
 要求：
-- 全部用简体中文。
+- {language_instruction}（不要输出其他语言）。
 - **合并要激进**：把相邻或相同话题的草稿尽可能合并成更少的章节。不要每个小话题单独成章——只有当话题确实有显著转折时才分开。目标是用最少的章节覆盖全片核心内容，但不遗漏关键信息。
 {mode_instruction}
 {query_instruction}
