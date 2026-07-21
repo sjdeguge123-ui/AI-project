@@ -445,6 +445,8 @@ def _transcribe_local(
             # 注意：config 默认 whisper.language="auto"，而 faster-whisper 不接受字符串 "auto"
             # （只接受 None 或具体语种码如 "zh"）。这里把 "auto" 归一为空串，worker 侧再转 None。
             "--language", str(language) if (language and language != "auto") else "",
+            # 让 worker 能检测 skill 主进程是否还活着：主进程若异常退出，worker 自清理，避免残留。
+            "--parent-pid", str(os.getpid()),
         ]
         print("   🔧 启动本地转录子进程（隔离 GPU 状态，避免崩溃拖垮主流程）...")
         proc = subprocess.Popen(

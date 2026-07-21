@@ -26,7 +26,7 @@ from typing import List, Optional
 
 from . import DetailedRow, GoldenQuote, Segment, Summary, Transcript, format_duration, format_timestamp
 from .config import AIConfig
-from .lang import _detect_language
+from .lang import _detect_language, _normalize_chinese
 from .ratelimit import RateLimiter
 
 
@@ -121,6 +121,11 @@ def _chunk_segments(segments: List[Segment], max_chars: int = _CHUNK_MAX_CHARS) 
 
 
 def _build_chunk_text(chunk: List[Segment]) -> str:
+    is_zh = _detect_language(chunk) == "zh"
+    if is_zh:
+        return "\n".join(
+            f"[{format_timestamp(s.start)}] {_normalize_chinese(s.text or '')}" for s in chunk
+        )
     return "\n".join(f"[{format_timestamp(s.start)}] {s.text}" for s in chunk)
 
 
@@ -267,19 +272,23 @@ def _needs_punctuation(text: str) -> bool:
 
 
 def _restore_punctuation(text: str, client, ai: AIConfig, proxy: str = "") -> str:
-    """轻量标点恢复：仅补中文标点，不改字、不增删内容、不动时间戳。
+    """轻量中文规范化：繁体转简体 + 补中文标点，不改字义、不增删内容、不动时间戳。
 
     仅在 transcript.language=='zh' 且文本基本无标点时调用；失败（无网络/异常）
     一律回退为原文本，绝不影响主流程。
     """
 
-    if not text or not _needs_punctuation(text):
+    if not text:
+        return text
+    # 先统一规范为简体中文（B站/YouTube 常见繁体、台湾字幕）
+    text = _normalize_chinese(text)
+    if not _needs_punctuation(text):
         return text
     sys_p = (
         "你是一个严谨的中文标点校对助手。下面是一段带 [MM:SS] 时间戳的中文语音识别原文。"
-        "请【仅】补上缺失的中文标点（逗号、句号、问号、感叹号、顿号等），让句子可以正常断句；"
-        "【绝对不要】改动、增删任何汉字或时间戳，【不要】输出任何解释或多余文字。"
-        "直接返回补好标点的原文。"
+        "请先把繁体字转换为简体字，然后【仅】补上缺失的中文标点（逗号、句号、问号、感叹号、顿号等），让句子可以正常断句；"
+        "【绝对不要】改动、增删任何汉字原意或时间戳，【不要】输出任何解释或多余文字。"
+        "直接返回规范化后的原文。"
     )
     user = text
     try:
@@ -392,8 +401,11 @@ def _build_full_text(segments: List[Segment], interval_sec: int = 180, max_chars
 
     用于「全文文案」模式：保留完整原文，仅用时间戳标出视频进度，方便回看定位。
     max_chars 限制总长度（默认约 3 万字），超长则截断并提示。
+
+    中文视频：对每段文本做繁简转换，确保输出为简体中文（B站常见繁体/台湾字幕）。
     """
 
+    is_zh = _detect_language(segments) == "zh"
     buf: List[str] = []
     last_ts = -1e9
     chars = 0
@@ -401,6 +413,8 @@ def _build_full_text(segments: List[Segment], interval_sec: int = 180, max_chars
         text = (s.text or "").strip()
         if not text:
             continue
+        if is_zh:
+            text = _normalize_chinese(text)
         if s.start - last_ts >= interval_sec:
             buf.append(f"\n\n[{format_timestamp(s.start)}] ")
             last_ts = s.start

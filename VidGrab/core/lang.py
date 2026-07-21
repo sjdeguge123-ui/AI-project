@@ -26,3 +26,25 @@ def _detect_language(segments) -> str:
         return ""
     cjk = sum(1 for ch in text if "一" <= ch <= "鿿")
     return "zh" if cjk / max(1, len(text)) > 0.08 else "en"
+
+
+def _normalize_chinese(text: str) -> str:
+    """把中文文本统一规范为简体中文。
+
+    使用 OpenCC 进行繁简转换（优先纯 Python 实现的 opencc-python-reimplemented，
+    无需系统库）。若未安装或转换失败，直接回退原文，绝不阻塞主流程。
+
+    仅对中文视频内容做规范化；英文/其他语种原文不动。
+    """
+    if not text:
+        return text
+    try:
+        import opencc
+
+        converter = getattr(_normalize_chinese, "_converter", None)
+        if converter is None:
+            converter = opencc.OpenCC("t2s")  # 繁体转简体
+            _normalize_chinese._converter = converter
+        return converter.convert(text)
+    except Exception:  # noqa: BLE001
+        return text

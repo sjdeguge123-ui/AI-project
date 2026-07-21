@@ -56,6 +56,7 @@ _ESSENTIAL_DEPS = [
     ("PIL", "Pillow"),         # 图片（PNG）摘要导出
     ("xhtml2pdf", "xhtml2pdf"),  # PDF 导出（纯 Python，无系统依赖，跨平台开箱即用）
     ("imageio_ffmpeg", "imageio-ffmpeg"),  # 内置 ffmpeg 二进制，无字幕流程无需用户手动安装系统 ffmpeg
+    ("opencc", "opencc-python-reimplemented"),  # 繁体字幕/翻译字幕 → 简体中文
 ]
 # 可选依赖（不自动安装）：WeasyPrint CSS 保真更好，但依赖系统库（Windows 需 GTK），
 # 装不全会 import 失败。默认 PDF 引擎已改用纯 Python 的 xhtml2pdf，无需 WeasyPrint。
@@ -197,15 +198,18 @@ def _parent_alive_win() -> bool:
 
 
 def _start_parent_watchdog() -> None:
-    """仅 Windows + 非交互（agent / 管道）模式启动：父进程死亡则自清理并退出。
+    """Windows 下总是启用：父进程（agent / 终端）死亡则自清理并退出。
 
     根因修复：本机曾出现 13 个 VidGrab 主进程被 agent 会话遗留成孤儿，一直占内存。
     看门狗每 5 秒检测父进程存活，父死即杀掉转录 worker 子进程并退出，从源头杜绝孤儿。
-    交互终端模式（stdin 是 tty）不启用——关闭终端会触发控制台事件杀进程，且避免误杀。
+
+    注意：之前用 sys.stdin.isatty() 区分交互/非交互，但 WorkBuddy agent 启动时 stdin 也可能是 tty，
+    导致看门狗没启用、继续产生残留进程。现在 Windows 上无条件启用：
+    - 正常交互终端运行：父进程（cmd/powershell）一直活着，skill 完成 return 后进程自然结束，
+      看门狗不会触发；
+    - agent / detached / 终端被关：父进程死亡，看门狗触发清理并 os._exit(0)。
     """
     if sys.platform != "win32":
-        return
-    if sys.stdin.isatty():
         return
     import threading
     import time

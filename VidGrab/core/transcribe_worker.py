@@ -54,12 +54,51 @@ def _parse_args():
                    help="断点续传起点（秒）。>0 时跳过已转录的块，从进度文件合并已有 segments。")
     p.add_argument("--language", default="auto",
                    help="语种锁定（auto=自动检测）。透传给 faster-whisper。")
+    p.add_argument("--parent-pid", type=int, default=None,
+                   help="skill 主进程 PID；若主进程死亡，worker 自动退出，避免残留。")
     p.add_argument("--output-json", required=True)
     return p.parse_args()
 
 
+def _start_parent_watchdog(parent_pid: int) -> None:
+    """worker 子进程守护：若 skill 主进程死亡，则 worker 立即自清理退出。
+
+    防止 skill 主进程被 agent/终端杀死后，worker 继续占用 GPU/内存跑完才退出，
+    造成用户看到「项目结束却还有 python 进程残留」的观感问题。
+    """
+    if sys.platform != "win32" or parent_pid <= 0:
+        return
+    import ctypes
+    import threading
+    import time
+    from ctypes import wintypes
+
+    kernel32 = ctypes.windll.kernel32
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+    def _alive(pid: int) -> bool:
+        h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not h:
+            return False
+        code = wintypes.DWORD()
+        kernel32.GetExitCodeProcess(h, ctypes.byref(code))
+        kernel32.CloseHandle(h)
+        return code.value == 259  # STILL_ACTIVE
+
+    def _loop() -> None:
+        while True:
+            if not _alive(parent_pid):
+                # 父进程已死，立即退出；不跑完、不写 JSON，因为主流程已经不存在
+                os._exit(2)
+            time.sleep(5)
+
+    threading.Thread(target=_loop, daemon=True).start()
+
+
 def main() -> int:
     args = _parse_args()
+    if args.parent_pid:
+        _start_parent_watchdog(args.parent_pid)
     try:
         # 延迟导入，避免子进程启动就加载重依赖（仅在成功路径需要）
         from core.transcriber import _run_local_transcription
