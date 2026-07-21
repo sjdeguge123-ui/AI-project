@@ -44,6 +44,22 @@ import atexit
 # 保证主进程无论以何种方式退出，worker 都会被清掉。
 _ACTIVE_WORKER = None
 
+# 会话级 GPU 失败标志：若某次本地转录因 cudnn/CUDA 冲突 fast-fail（exit 3221226505），
+# 本进程后续所有本地转录直接走 CPU，避免反复 GPU 崩溃 + 反复打印吓人日志。
+# 用「会话级」而非「永久」标志，避免把偶发驱动问题误判成永远不能用 GPU。
+_GPU_CUDA_CRASHED = False
+
+
+def _mark_gpu_cuda_crashed() -> None:
+    """记录一次 GPU cudnn/CUDA fast-fail，使本会话后续转录直接走 CPU。"""
+    global _GPU_CUDA_CRASHED
+    _GPU_CUDA_CRASHED = True
+
+
+def _gpu_confirmed_unstable() -> bool:
+    """本会话 GPU 是否已确认因 cudnn 冲突不稳定（应跳过 GPU 走 CPU）。"""
+    return _GPU_CUDA_CRASHED
+
 
 def _kill_active_worker() -> None:
     """强制结束当前正在运行的转录 worker 子进程（若有）。"""
@@ -463,6 +479,7 @@ def _transcribe_local(
     从断点续跑而非从头重来。GPU→CPU 回退时固定 chunk_sec=120，保证分块边界一致。
     """
 
+    global _GPU_CUDA_CRASHED
     audio_path = Path(audio_path)
     json_path = audio_path.with_suffix(".segments.json")
     progress_path = Path(str(audio_path) + ".progress.json")
@@ -480,6 +497,12 @@ def _transcribe_local(
     prev_rc: Optional[int] = None
     prev_child_text = ""
     for run_i in range(1, max_runs + 1):
+        # 本会话已确认 GPU 因 cudnn 冲突不稳定：直接走 CPU，跳过 GPU 尝试与吓人日志
+        if run_i == 1 and _gpu_confirmed_unstable() and use_device in ("auto", "cuda"):
+            use_device = "cpu"
+            use_compute_type = "int8"
+            use_chunk_sec = 120
+            print("   🖥️ 本会话 GPU 已确认不稳定（cudnn 冲突），直接用 CPU 转录，主流程不受影响。")
         if run_i > 1:
             print(f"   🔁 重试本地转录子进程（第 {run_i}/{max_runs} 次）...")
             # 若前一次走 GPU 路径硬崩溃，重试强制 CPU（牺牲速度换稳定）
@@ -487,6 +510,9 @@ def _transcribe_local(
                 crash_reason = _classify_worker_exit(prev_rc, prev_child_text)
                 print(f"   🖥️ GPU 路径已崩溃（exit code={prev_rc}），{crash_reason}")
                 print("   🔄 已自动改用 CPU（更稳定，速度较慢）并从断点续传，主流程不受影响。")
+                # 记录会话级 GPU 失败，后续视频直接走 CPU，不再反复崩 GPU
+                if prev_rc == 3221226505 or "STATUS_STACK_BUFFER_OVERRUN" in (prev_child_text or ""):
+                    _mark_gpu_cuda_crashed()
                 use_device = "cpu"
                 use_compute_type = "int8"
                 use_chunk_sec = 120

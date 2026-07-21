@@ -96,27 +96,44 @@ def _start_parent_watchdog(parent_pid: int) -> None:
 
 
 def _preload_ctranslate2_cudnn() -> None:
-    """Windows 下优先加载 ctranslate2 自带的 cudnn64_9.dll，避免与 torch 的 cudnn 版本冲突。
+    """Windows 下优先加载 ctranslate2 自带的整套 CUDA/cudnn 运行时，避免与 torch 的 cudnn 版本冲突。
 
-    根因：ctranslate2 与 torch 都自带 cudnn64_9.dll 且版本/体积不同；
-    若 torch 的 cudnn 先被加载，ctranslate2 会拿到不兼容版本，触发 STATUS_STACK_BUFFER_OVERRUN
-    （0xC0000409 / 3221226505）原生 fast-fail 中止。通过显式预加载 ctranslate2 的 cudnn，
-    让后续 torch/ctranslate2 使用同一份兼容 DLL。
+    根因：ctranslate2 与 torch 都自带 cudnn64_9.dll 且版本/体积不同；cudnn 实际是一整套
+    DLL（cudnn64_9 / cudnn_adv_infer64_9 / cudnn_cnn_infer64_9 / cudnn_ops_infer64_9 等 +
+    cublas64_12），转录时 CUDA 运行时按默认搜索顺序解析到 torch 目录那份错配版本，
+    触发 STATUS_STACK_BUFFER_OVERRUN（0xC0000409 / 3221226505）原生 fast-fail 中止。
+    做法：① 把 ctranslate2 库目录加入 DLL 搜索路径（前置 PATH + add_dll_directory）；
+    ② 预加载整组 CUDA/cudnn DLL，使其成为「已加载模块」被后续同名 LoadLibrary 复用。
     """
 
     if sys.platform != "win32":
         return
     try:
         import ctypes
+        import glob
         import importlib.util
+        import os
         from pathlib import Path
 
         spec = importlib.util.find_spec("ctranslate2")
         if not spec or not spec.origin:
             return
-        cudnn_path = Path(spec.origin).parent / "cudnn64_9.dll"
-        if cudnn_path.exists():
-            ctypes.windll.kernel32.LoadLibraryW(str(cudnn_path))
+        ct_dir = Path(spec.origin).parent
+        # 1) 把 ctranslate2 库目录加入 DLL 搜索路径（前置 PATH + add_dll_directory），
+        #    让后续加载全部 cudnn*_9 / cublas64_* 时优先命中 ctranslate2 自带一致版本。
+        os.environ["PATH"] = str(ct_dir) + os.pathsep + os.environ.get("PATH", "")
+        try:
+            os.add_dll_directory(str(ct_dir))
+        except Exception:  # noqa: BLE001
+            pass
+        # 2) 预加载 ctranslate2 目录下整组 CUDA/cudnn 运行时 DLL（不止 cudnn64_9.dll），
+        #    使其以「已加载模块」身份被后续同名 LoadLibrary 复用，避免从 torch 目录解析到错配版本。
+        for pat in ("cudnn*_*.dll", "cublas64_*.dll", "c10*.dll"):
+            for dll in glob.glob(str(ct_dir / pat)):
+                try:
+                    ctypes.windll.kernel32.LoadLibraryW(dll)
+                except Exception:  # noqa: BLE001
+                    pass
     except Exception:  # noqa: BLE001
         # 预加载失败不阻塞主流程，让正常 import 自己处理
         pass
