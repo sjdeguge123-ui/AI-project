@@ -1,0 +1,89 @@
+"""针对用户本轮 4 项问题的回归单测（无需重依赖即可跑）。
+
+覆盖：
+- 语言检测：中文→zh / 英文→en / 空→""（修复英文视频被错误加中文标点）
+- 分P 文件名：多P 时带 -P{n} 后缀，且正文标题的「P{n} · 」前缀在文件名中被剥离（不重复）
+- 全选：_select_formats("all") 返回全部 5 种格式
+"""
+
+import os
+import sys
+
+# 把项目根（tests/ 的上一级）加入 sys.path，使 `from core...` / `import skill.main` 可解析
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+import types
+
+
+def _seg(text):
+    class S:
+        def __init__(self, t):
+            self.text = t
+    return S(text)
+
+
+def test_detect_language():
+    from core.platforms.bilibili import _detect_language
+
+    zh = [_seg("这是一段中文语音识别的文字内容，讲得非常好。")]
+    en = [_seg("This is an English transcript of the audio speech.")]
+    assert _detect_language(zh) == "zh"
+    assert _detect_language(en) == "en"
+    assert _detect_language([]) == ""
+
+
+def test_safe_title_multipp_strips_prefix():
+    import re
+    from core import exporter
+
+    class FakePlatform:
+        value = "bilibili"
+    class T:
+        title = "P1 · 道德经演讲录 - 第一集"
+        author = "白岩松"
+        platform = FakePlatform()
+        video_id = "BV1CW411P7rb"
+        is_collection = True
+        page_index = 0  # -> P1
+
+    name = exporter._safe_title(T(), "全文文案")
+    # 文件名应以 -P1 结尾，且不应再含 "P1 · " 前缀（避免重复）
+    assert name.endswith("-P1"), name
+    assert "P1 · " not in name, name
+    assert "全文文案" in name
+
+
+def test_safe_title_singlep_no_suffix():
+    from core import exporter
+
+    class FakePlatform:
+        value = "bilibili"
+    class T:
+        title = "普通单P视频标题"
+        author = ""
+        platform = FakePlatform()
+        video_id = "BVxxxx"
+        is_collection = False
+        page_index = 0
+
+    name = exporter._safe_title(T(), "精简")
+    assert "-P" not in name, name
+    assert name.endswith("精简")
+
+
+def test_select_formats_all():
+    # 直接测 CLI/forced 分支的「全选」
+    import skill.main as m
+
+    assert m._select_formats(forced="all") == ["markdown", "html", "docx", "pdf", "image"]
+    assert m._select_formats(forced="全选") == ["markdown", "html", "docx", "pdf", "image"]
+
+
+if __name__ == "__main__":
+    test_detect_language()
+    test_safe_title_multipp_strips_prefix()
+    test_safe_title_singlep_no_suffix()
+    test_select_formats_all()
+    print("ALL ISSUE-FIX TESTS PASSED")

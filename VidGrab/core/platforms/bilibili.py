@@ -77,6 +77,19 @@ def get_bilibili_pages(url: str, sessdata: str = "") -> dict:
     }
 
 
+def _detect_language(segments) -> str:
+    """按转录文本中的中文字符占比判断真实语种：中文视频返回 'zh'，否则 'en'。
+
+    B站视频不分语种，之前一律标 'zh' 会导致英文视频被错误加中文标点、且全文语种误判。
+    无文本（如尚未转录的音频路径）返回空串，交给转录/摘要阶段再判定。
+    """
+    text = " ".join(getattr(s, "text", "") or "" for s in segments)
+    if not text.strip():
+        return ""
+    cjk = sum(1 for ch in text if "一" <= ch <= "鿿")
+    return "zh" if cjk / max(1, len(text)) > 0.08 else "en"
+
+
 def extract_bilibili(
     url: str,
     workdir: Optional[Path] = None,
@@ -106,6 +119,14 @@ def extract_bilibili(
     publish_time = _ts_to_date(info.get("pubdate"))
     # 合集处理：用选中页的 cid 和 part 名称
     raw_pages = info.get("pages") or []
+    # 部分合集在 get_info().pages 里只返回 1 条，需用 get_pages() 复核真实分P数
+    if len(raw_pages) <= 1:
+        try:
+            _pp = sync(v.get_pages()) or []
+            if len(_pp) > 1:
+                raw_pages = _pp
+        except Exception:
+            pass
     is_collection = len(raw_pages) > 1
     if raw_pages and len(raw_pages) > 1:
         page_info = raw_pages[page_index]
@@ -115,6 +136,8 @@ def extract_bilibili(
         # 标题加上分P名称，便于区分
         if part_name:
             title = f"{title} - {part_name}"
+        # 多P：标题前缀加「P{n} · 」，让导出文档的标题也明确体现是第几集
+        title = f"P{page_index + 1} · {title}"
         # 合集的音频下载用带 p 参数的 URL
         audio_url = f"{url.split('?')[0]}?p={page_index + 1}"
     else:
@@ -144,7 +167,7 @@ def extract_bilibili(
             audio_path=str(audio_path),
             page_index=page_index,
             is_collection=is_collection,
-            language="zh",
+            language=_detect_language(segments),
         )
 
     # 1) 优先用 bilibili_api 取真字幕（需要登录 cookie）
@@ -181,7 +204,7 @@ def extract_bilibili(
             source="subtitle",
             page_index=page_index,
             is_collection=is_collection,
-            language="zh",
+            language=_detect_language(segments),
         )
 
     if download_audio:
@@ -200,7 +223,7 @@ def extract_bilibili(
             audio_path=str(audio_path),
             page_index=page_index,
             is_collection=is_collection,
-            language="zh",
+            language=_detect_language(segments),
         )
 
     # 3) 两种都取不到真字幕：给出「登录引导」而不是干巴巴的报错

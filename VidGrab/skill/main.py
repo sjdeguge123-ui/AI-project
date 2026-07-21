@@ -228,6 +228,9 @@ def _select_formats(forced: str = None, title: str = "") -> list:
     valid = ("md", "markdown", "html", "docx", "word", "pdf", "image", "png", "jpg", "jpeg")
 
     if forced:
+        f = (forced or "").strip().lower()
+        if f in ("all", "全选", "全部", "0"):
+            return ["markdown", "html", "docx", "pdf", "image"]
         formats = []
         for c in forced.replace("，", ",").split(","):
             c = c.strip().lower()
@@ -245,19 +248,22 @@ def _select_formats(forced: str = None, title: str = "") -> list:
     else:
         print("\n【步骤 ⑥】选择输出格式")
     print("   支持的格式：")
+    print("     0. 全选（一次性导出全部：Markdown / HTML / Word / PDF / 图片）")
     print("     1. Markdown (.md)  —— 通用，推荐")
     print("     2. HTML (.html)    —— 可在浏览器打开，样式美观")
     print("     3. Word (.docx)    —— 可在 Word/WPS 编辑")
     print("     4. PDF (.pdf)      —— 适合打印/分享")
     print("     5. 图片 (.png)     —— 信息图，便于分享/预览")
-    print("   可多选，用逗号分隔（如 1,3）；回车默认 Markdown")
+    print("   可多选，用逗号分隔（如 1,3）；输入 0 全选；回车默认 Markdown")
     try:
-        choice = input("请选择：").strip()
+        choice = input("请选择：").strip().lower()
     except (EOFError, KeyboardInterrupt):
         choice = ""
 
     if not choice:
         return ["markdown"]
+    if choice in ("0", "all", "全选", "全部"):
+        return ["markdown", "html", "docx", "pdf", "image"]
 
     formats = []
     for c in choice.replace("，", ",").split(","):
@@ -444,12 +450,12 @@ def _offer_other_versions(t, cfg, proxy: str, formats: list, first_mode: str, fi
     while True:
         head = f"《{title}》" if title else ""
         print(f"\n💡 {head}已导出一版，是否还要其他版本？")
-        print("   1. 详细   2. 自定义（关键词）   3. 全文文案   4. 不需要了，退出")
+        print("   1. 精简   2. 详细   3. 自定义（关键词）   4. 全文文案   5. 不需要了，退出")
         try:
             prompt = (
-                f"《{title}》请选择（1-4，默认 4 退出；100 秒无操作自动退出）："
+                f"《{title}》请选择（1-5，默认 5 退出；100 秒无操作自动退出）："
                 if title else
-                "请选择（1-4，默认 4 退出；100 秒无操作自动退出）："
+                "请选择（1-5，默认 5 退出；100 秒无操作自动退出）："
             )
             choice = _timed_input(prompt, timeout=100)
         except TimeoutError:
@@ -459,12 +465,14 @@ def _offer_other_versions(t, cfg, proxy: str, formats: list, first_mode: str, fi
             print("\n👋 已退出。")
             return
 
-        if choice in ("", "4"):
+        if choice in ("", "5"):
             print("👋 已退出，无需其他版本。")
             return
         if choice == "1":
-            m, kw = "detailed", ""
+            m, kw = "concise", ""
         elif choice == "2":
+            m, kw = "detailed", ""
+        elif choice == "3":
             try:
                 kw = input("   " + _title_prefix(title) + "请输入你想关注的关键词或一段话：").strip()
             except (EOFError, KeyboardInterrupt):
@@ -472,7 +480,7 @@ def _offer_other_versions(t, cfg, proxy: str, formats: list, first_mode: str, fi
             if not kw:
                 continue
             m = "query"
-        elif choice == "3":
+        elif choice == "4":
             m, kw = "fulltext", ""
         else:
             print("   ⚠️ 无效选择，请重试。")

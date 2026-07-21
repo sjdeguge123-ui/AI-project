@@ -223,16 +223,15 @@ def _raw_content(raw) -> str:
 
 
 def _language_instruction(language: str) -> str:
-    """根据视频语种生成「输出语言跟随视频」的指令片段。
+    """摘要输出语言指令：用户要求【始终】用简体中文（含中文标点）输出。
 
-    中文视频强制简体中文；英文视频用英文；其余（auto/空）保持中文兜底。
+    全文文案（transcript）跟随音频真实语种，由 _restore_punctuation 的语种守卫控制，
+    不在此处处理。摘要无论视频是什么语种都按用户要求输出简体中文。
     """
-
-    lang = (language or "").lower()
-    if lang == "en":
-        return "全部用英语输出（与视频语言一致）。"
-    # 默认中文（含 zh / auto / 空 / 其他未知）
-    return "全部用简体中文输出（与视频语言一致）。"
+    return (
+        "全部用简体中文输出，并使用中文标点（逗号、句号、问号、感叹号、顿号等）正常断句；"
+        "涉及外文专有名词可保留原文（如英文术语、人名），但叙述语言必须是简体中文。"
+    )
 
 
 # 中文（CJK）常用标点；用于判断转录文本是否已具备基本断句标点
@@ -243,6 +242,19 @@ def _needs_punctuation(text: str) -> bool:
     """文本中基本没有 CJK 标点时才需要补标点。"""
 
     return not any(ch in _CJK_PUNCT for ch in (text or ""))
+
+
+def _detect_language(segments) -> str:
+    """按转录文本中的中文字符占比判断真实语种，用于决定是否做中文标点恢复。
+
+    与 bilibili._detect_language 同源逻辑：中文占比 >8% 视为 'zh'，否则 'en'。
+    空文本返回 ''（不恢复标点）。
+    """
+    text = " ".join(getattr(s, "text", "") or "" for s in segments)
+    if not text.strip():
+        return ""
+    cjk = sum(1 for ch in text if "一" <= ch <= "鿿")
+    return "zh" if cjk / max(1, len(text)) > 0.08 else "en"
 
 
 def _restore_punctuation(text: str, client, ai: AIConfig, proxy: str = "") -> str:
@@ -483,8 +495,9 @@ def generate_summary(
     # 全文文案模式：不调 AI 分章，直接输出带时间戳的连续转录文案（内容概述仍用一次轻量调用生成）
     if mode == "fulltext":
         full_text = _build_full_text(transcript.segments)
-        # 中文视频且转录基本无标点时，做一次轻量标点恢复（失败回退原文本）
-        full_text = _restore_punctuation(full_text, client, ai, proxy)
+        # 仅当转录文本确为「真实中文」时才做轻量标点恢复；英文/未知语种不强行加中文标点
+        if _detect_language(transcript.segments) == "zh":
+            full_text = _restore_punctuation(full_text, client, ai, proxy)
         try:
             overview = _generate_overview(transcript, client, ai, proxy, rate_limiter)
         except Exception:  # noqa: BLE001

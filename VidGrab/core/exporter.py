@@ -57,6 +57,9 @@ def _safe_title(transcript: Transcript, mode_label: str = "") -> str:
     """
     title = transcript.title or f"{transcript.platform.value}_{transcript.video_id}"
     title = _ILLEGAL_CHARS.sub("_", title).strip().strip(".")
+    # 多P 视频的标题已带「P{n} · 」前缀（用于正文标题明确第几集），
+    # 文件名统一用 -P{n} 后缀体现，这里剥离前缀避免重复出现。
+    title = re.sub(r"^P\d+\s*[·・\-]\s*", "", title)
 
     # 标题过长则改为「标题摘要」（截断 + 省略号）
     if len(title) > _TITLE_MAX:
@@ -83,6 +86,8 @@ def _unique_path(save_dir: Path, base_name: str, ext: str) -> Path:
     candidate = save_dir / f"{base_name}.{ext}"
     if not candidate.exists():
         return candidate
+    # 计数器后缀：_2 … _99（最多 98 个，避免无界增长）；仍冲突则退化为时间戳，
+    # 保证「绝不静默覆盖已有文件」。
     for n in range(2, 100):
         candidate = save_dir / f"{base_name}_{n}.{ext}"
         if not candidate.exists():

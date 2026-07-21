@@ -377,6 +377,10 @@ def _transcribe_local(
         env["MKL_NUM_THREADS"] = "1"
         env["MKL_DYNAMIC"] = "FALSE"
         env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+        # GPU 修复（二）：NVIDIA 懒加载 CUDA 模块（CUDA 11.7+），大幅降低加载
+        # cublas64_12.dll 等时对 Windows 页面文件（提交内存）的峰值占用，
+        # 根治 WinError 1455「页面文件太小，无法完成操作」。CPU 模式下此变量无害。
+        env["CUDA_MODULE_LOADING"] = "LAZY"
 
         cmd = [
             sys.executable, "-u", "-m", "core.transcribe_worker",
@@ -439,11 +443,22 @@ def _transcribe_local(
             oom_streak += 1
         else:
             oom_streak = 0
+        # 针对「页面文件太小」(WinError 1455) 给出更精准的可执行提示
+        if "页面文件太小" in child_text or "WinError 1455" in child_text:
+            hint = (
+                "GPU 加载 CUDA 库时触发 Windows「页面文件太小」(WinError 1455)：\n"
+                "已自动注入 CUDA_MODULE_LOADING=LAZY 降低页面文件占用；若仍报此错，"
+                "请到「系统→高级系统设置→性能→高级→虚拟内存」把页面文件调到物理内存的 1.5–2 倍并重启，"
+                "或直接在 config.yaml 设 whisper.mode: api 走云端转录，彻底规避本地显存/内存限制。"
+            )
+        else:
+            hint = (
+                "常见原因：① 模型加载/GPU 崩溃（瞬时内存分配失败）② 音频文件损坏 ③ 依赖缺失。\n"
+                "建议：在 config.yaml 设置 whisper.device: cpu 或 whisper.compute_type: int8，"
+                "或改用 whisper.mode: api 云端转录。"
+            )
         last_err = RuntimeError(
-            f"本地转录子进程异常退出（exit code={rc}）。\n"
-            "常见原因：① 模型加载/GPU 崩溃（瞬时内存分配失败）② 音频文件损坏 ③ 依赖缺失。\n"
-            "建议：在 config.yaml 设置 whisper.device: cpu 或 whisper.compute_type: int8，"
-            "或改用 whisper.mode: api 云端转录。"
+            f"本地转录子进程异常退出（exit code={rc}）。\n" + hint
         )
         # 清理可能残留的 json（进度文件保留用于续传）
         try:
