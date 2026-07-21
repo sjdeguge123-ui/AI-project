@@ -53,6 +53,7 @@ def extract(
     cookies_file: str = "",
     force_audio: bool = False,
     page_index: int = 0,
+    lang_source: str = "original",
 ) -> Transcript:
     """统一提取入口：识别平台后分发给对应提取器。
 
@@ -79,6 +80,7 @@ def extract(
         return extract_bilibili(
             url, workdir=workdir, download_audio=download_audio,
             sessdata=sessdata, force_audio=force_audio, page_index=page_index,
+            lang_source=lang_source,
         )
     if platform == Platform.YOUTUBE:
         return extract_youtube(

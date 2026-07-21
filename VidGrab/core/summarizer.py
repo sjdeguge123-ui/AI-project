@@ -288,11 +288,33 @@ def _needs_punctuation(text: str) -> bool:
     return not any(ch in _CJK_PUNCT for ch in (text or ""))
 
 
+def _rule_based_punctuate(text: str) -> str:
+    """确定性中文断句兜底：以 [MM:SS] 时间戳为界，每块末尾补句号，避免完全无标点。
+
+    仅在 LLM 补标点失败（限流/网络）时启用，保证全文至少具备句读，
+    不依赖外部服务，绝不丢内容、不动时间戳。
+    """
+    import re
+
+    parts = re.split(r"(\[[\d:]+\])", text)
+    out = parts[0] if parts else ""
+    i = 1
+    while i < len(parts):
+        ts = parts[i]
+        chunk = (parts[i + 1] if i + 1 < len(parts) else "").rstrip()
+        if chunk and chunk[-1] not in "。！？…":
+            chunk = chunk + "。"
+        out += ts + chunk
+        i += 2
+    return out
+
+
 def _restore_punctuation(text: str, client, ai: AIConfig, proxy: str = "") -> str:
     """轻量中文规范化：繁体转简体 + 补中文标点，不改字义、不增删内容、不动时间戳。
 
-    仅在 transcript.language=='zh' 且文本基本无标点时调用；失败（无网络/异常）
-    一律回退为原文本，绝不影响主流程。
+    仅在 transcript.language=='zh' 且文本基本无标点时调用。
+    鲁棒性：LLM 补标点偶发失败（限流/网络）时先退避重试；
+    仍失败则用确定性规则断句兜底，绝不再「完全无标点」（免费档限流高发）。
     """
 
     if not text:
@@ -307,24 +329,35 @@ def _restore_punctuation(text: str, client, ai: AIConfig, proxy: str = "") -> st
         "【绝对不要】改动、增删任何汉字原意或时间戳，【不要】输出任何解释或多余文字。"
         "直接返回规范化后的原文。"
     )
-    user = text
-    try:
-        from .ratelimit import RateLimiter
+    # 退避重试（免费档限流高发，避免一次失败就丢标点）
+    for attempt in range(3):
+        try:
+            from .ratelimit import RateLimiter
 
-        rl = RateLimiter(tier=ai.tier, provider=ai.provider, model=ai.model)
-        rl.wait_before_call()
-        raw = client.chat.completions.with_raw_response.create(
-            model=ai.model,
-            messages=[
-                {"role": "system", "content": sys_p},
-                {"role": "user", "content": user},
-            ],
-            temperature=0.0,
-            max_tokens=max(len(text) * 2, 2048),
-        )
-        return _raw_content(raw).strip() or text
-    except Exception:  # noqa: BLE001
-        return text
+            rl = RateLimiter(tier=ai.tier, provider=ai.provider, model=ai.model)
+            rl.wait_before_call()
+            raw = client.chat.completions.with_raw_response.create(
+                model=ai.model,
+                messages=[
+                    {"role": "system", "content": sys_p},
+                    {"role": "user", "content": text},
+                ],
+                temperature=0.0,
+                max_tokens=max(len(text) * 2, 2048),
+            )
+            result = _raw_content(raw).strip()
+            if result:
+                return result
+        except Exception as e:  # noqa: BLE001
+            err = str(e)
+            if "429" in err or "503" in err or "too busy" in err.lower():
+                import time
+
+                time.sleep((attempt + 1) * 5)
+                continue
+            break  # 非限流错误，直接走兜底
+    # 兜底：确定性规则断句，保证至少有标点
+    return _rule_based_punctuate(text)
 
 
 def _call_llm(client, ai: AIConfig, system_prompt: str, user_msg: str,
@@ -539,8 +572,10 @@ def generate_summary(
     # 全文文案模式：不调 AI 分章，直接输出带时间戳的连续转录文案（内容概述仍用一次轻量调用生成）
     if mode == "fulltext":
         full_text = _build_full_text(transcript.segments, lang=transcript.language or "")
-        # 仅当 transcript 确为「真实中文」时才做轻量标点恢复；英文/日韩/未知语种不强行加中文标点
-        if transcript.language == "zh":
+        # 统一语种判断：与 _build_full_text 的 is_zh 口径一致，
+        # 避免 transcript.language 为空但文本中文时只繁简不补标点（问题1潜在项）
+        is_zh = (transcript.language or _detect_language(transcript.segments)) == "zh"
+        if is_zh:
             full_text = _restore_punctuation(full_text, client, ai, proxy)
         try:
             overview = _generate_overview(transcript, client, ai, proxy, rate_limiter)

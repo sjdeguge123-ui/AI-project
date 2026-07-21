@@ -338,6 +338,34 @@ def _select_formats(forced: str = None, title: str = "") -> list:
     return formats or ["markdown"]
 
 
+def _select_language_source(forced: str = None, title: str = "") -> str:
+    """选择语种来源：original（跟随视频真实语种）/ chinese（中文翻译）。默认 original。
+
+    - forced 不为 None：直接解析（original/chinese），不阻塞；
+    - 非交互环境：默认 original（符合「听到什么语种就什么语种」的硬诉求）；
+    - 交互环境：列出选项让用户选。
+    """
+    valid = {"original", "chinese"}
+    if forced:
+        f = (forced or "original").lower().strip()
+        return f if f in valid else "original"
+    if not sys.stdin.isatty():
+        return "original"
+    if title:
+        print(f"\n【步骤 ④-1】关于《{title}》，选择语种来源")
+    else:
+        print("\n【步骤 ④-1】选择语种来源")
+    print("   1. 原语种（跟随视频真实语言：英语视频输出英文、日语视频输出日语）")
+    print("   2. 中文翻译（强制输出中文，使用 B站/YouTube 提供的中文字幕）")
+    try:
+        choice = input("请选择（1/2，回车默认 1 原语种）：").strip()
+    except (EOFError, KeyboardInterrupt):
+        choice = ""
+    if choice == "2":
+        return "chinese"
+    return "original"
+
+
 def _select_mode(forced: str = None, keywords: str = "", title: str = "") -> tuple:
     """选择内容输出模式。返回 (mode, keywords)。
 
@@ -468,10 +496,11 @@ def _timed_input(prompt: str, timeout: float = 100) -> str:
     return (box.get("v") or "").strip()
 
 
-def _export_one(t, cfg, proxy: str, formats: list, mode: str, keywords: str = "") -> list:
+def _export_one(t, cfg, proxy: str, formats: list, mode: str, keywords: str = "", version_no: int = 1) -> list:
     """生成指定模式的摘要并导出，返回生成的文件路径列表。
 
     供「首个版本」与「交互式追加其他版本」复用，避免重复下载/转录。
+    version_no：第几个版本（1 起），用于控制台分隔横幅，避免多次导出输出混乱。
     """
 
     _MODE_LABEL = {
@@ -481,7 +510,11 @@ def _export_one(t, cfg, proxy: str, formats: list, mode: str, keywords: str = ""
         "fulltext": "全文文案（带时间戳全文）",
     }
     mode_label = _short_mode_label(mode, keywords)
-    print(f"\n   内容模式：{_MODE_LABEL.get(mode, mode)}")
+    # 可见分隔横幅：让每次导出在控制台清晰分开（解决多次导出输出混乱）
+    print(f"\n{'─' * 50}")
+    print(f"  ▌第 {version_no} 版 · {_MODE_LABEL.get(mode, mode)}")
+    print(f"  ▌导出格式：{', '.join(formats)}")
+    print(f"{'─' * 50}")
 
     # ⏱️ AI 摘要预估时间（转录已完成，这里只估算 AI 摘要部分，提前告知用户）
     if mode != "fulltext":
@@ -507,12 +540,14 @@ def _offer_other_versions(t, cfg, proxy: str, formats: list, first_mode: str, fi
 
     用户明确不需要 / 超时未回复 → 退出（中间文件由主流程 finally 清理）。
     用户选择其他版本 → 重新生成并导出，可继续追问。
+    每次追加都会提示「复用格式」并允许更换，且每次导出前有版本分隔横幅。
     """
 
     tried = {first_mode}
+    version_no = 2  # 首版已导出，追加从 2 开始
     while True:
         head = f"《{title}》" if title else ""
-        print(f"\n💡 {head}已导出一版，是否还要其他版本？")
+        print(f"\n💡 {head}已导出 {version_no - 1} 版，是否还要其他版本？")
         print("   1. 精简   2. 详细   3. 自定义（关键词）   4. 全文文案   5. 不需要了，退出")
         try:
             # 标题已在上方 💡 行展示，输入提示不再重复，避免冗余
@@ -545,11 +580,25 @@ def _offer_other_versions(t, cfg, proxy: str, formats: list, first_mode: str, fi
             print("   ⚠️ 无效选择，请重试。")
             continue
 
+        # 追加版本：复用首次格式，但允许用户更换（回车沿用；输入新格式如 md,html 则改）
+        try:
+            fmt_in = _timed_input(
+                f"   复用格式：{', '.join(formats)}（回车沿用，或输入新格式如 md,html）：",
+                timeout=30,
+            )
+        except TimeoutError:
+            fmt_in = ""
+        if fmt_in:
+            new_formats = _select_formats(forced=fmt_in, title=title)
+            if new_formats:
+                formats = new_formats
+
         if m in tried:
             print(f"   （{m} 已生成过，重新生成一次）")
         tried.add(m)
         try:
-            _export_one(t, cfg, proxy, formats, m, kw)
+            _export_one(t, cfg, proxy, formats, m, kw, version_no=version_no)
+            version_no += 1
         except Exception as exc:  # noqa: BLE001
             print(f"   ❌ 生成失败：{exc}")
 
@@ -583,6 +632,9 @@ def _run_bilibili(url: str, cfg, force_audio: bool = False, page_index: int | No
     print("\n【步骤 ③】检测视频信息（合集会让你选集）...")
     page_index = _select_page(url, sessdata, forced=page_index)
 
+    # ③-1 语种来源（原语种 / 中文翻译）—— 影响字幕选择与后续语种指令
+    lang_source = _select_language_source(title="")
+
     if force_audio:
         print(f"\n   强制音频转录模式（--audio）：忽略字幕，直接下载音频转录")
     else:
@@ -592,7 +644,7 @@ def _run_bilibili(url: str, cfg, force_audio: bool = False, page_index: int | No
     try:
         t = extractor.extract(
             url, download_audio=True, sessdata=sessdata, force_audio=force_audio,
-            page_index=page_index, workdir=run_workdir,
+            page_index=page_index, workdir=run_workdir, lang_source=lang_source,
         )
         print(f"✅ 提取完成：《{t.title}》")
         print(f"   作者：{t.author or '未知'}  时长：{_fmt_dur(t.duration)}  字幕段数：{len(t.segments)}")

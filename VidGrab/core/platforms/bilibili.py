@@ -85,6 +85,7 @@ def extract_bilibili(
     sessdata: str = "",
     force_audio: bool = False,
     page_index: int = 0,
+    lang_source: str = "original",
 ) -> Transcript:
     """提取一个 B站视频：返回带字幕的 Transcript。
 
@@ -172,7 +173,7 @@ def extract_bilibili(
                 cid = None
         if cid:
             sub_info = sync(v.get_subtitle(cid=cid)) or {}
-            segments, subtitle_lang = _fetch_bilibili_subtitle(sub_info, workdir)
+            segments, subtitle_lang = _fetch_bilibili_subtitle(sub_info, workdir, lang_source=lang_source)
     except Exception as exc:  # noqa: BLE001
         print(f"[bilibili] bilibili_api 取字幕失败（{exc}），回退 yt-dlp")
 
@@ -224,19 +225,68 @@ def extract_bilibili(
     )
 
 
-def _fetch_bilibili_subtitle(sub_info: dict, workdir: Optional[Path]) -> Tuple[List[Segment], str]:
-    """从 bilibili_api 返回的 subtitle 结构里，下载并解析首选（优先中文）字幕。"""
+def _is_machine_translation(lan: str) -> bool:
+    """判断 B站字幕 lan 是否为机翻字幕（ai-* 前缀，如 ai-zh / ai-ja）。"""
+    return (lan or "").lower().startswith("ai-")
+
+
+def _choose_subtitle(subtitles: list, prefer_chinese: bool):
+    """按语种来源选择首选字幕。
+
+    prefer_chinese=True（用户要中文翻译）：优先含 zh 字幕（含 ai-zh 机翻），其次第一个。
+    prefer_chinese=False（原语种）：优先「非机翻、非中文」的原始字幕（视频真实语言字幕）；
+        找不到时降级到含 zh 字幕（可能是中文原声，或只能拿中文机翻），并提示用户。
+    返回 (chosen_subtitle_dict, degraded: bool)。
+    """
+    if not subtitles:
+        return None, False
+    if prefer_chinese:
+        chosen = next(
+            (s for s in subtitles if "zh" in (s.get("lan", "") or "").lower()),
+            subtitles[0],
+        )
+        return chosen, False
+    # 原语种：优先非机翻、非中文的原始字幕（视频真实语言）
+    originals = [
+        s for s in subtitles
+        if not _is_machine_translation(s.get("lan", ""))
+        and "zh" not in (s.get("lan", "") or "").lower()
+    ]
+    if originals:
+        return originals[0], False
+    # 降级：只有中文（可能是中文原声，或 B站只提供了中文机翻）
+    zh = next(
+        (s for s in subtitles if "zh" in (s.get("lan", "") or "").lower()),
+        None,
+    )
+    return (zh or subtitles[0]), True
+
+
+def _fetch_bilibili_subtitle(
+    sub_info: dict, workdir: Optional[Path], lang_source: str = "original"
+) -> Tuple[List[Segment], str]:
+    """从 bilibili_api 返回的 subtitle 结构里，下载并解析首选字幕。
+
+    lang_source:
+      - "original"：跟随视频真实语种，优先选非机翻、非中文的原始字幕；
+      - "chinese"：强制中文翻译，优先选含 zh 字幕（含 ai-zh 机翻）。
+    """
 
     import requests
 
     subtitles = sub_info.get("subtitles") or sub_info.get("regular_subtitles") or []
     if not subtitles:
-        return []
-    # 优先中文，其次取第一个
-    chosen = next((s for s in subtitles if "zh" in (s.get("lan", "") or "").lower()), subtitles[0])
+        return [], ""
+    prefer_chinese = (lang_source or "original") == "chinese"
+    chosen, degraded = _choose_subtitle(subtitles, prefer_chinese)
+    if degraded:
+        print(
+            "[bilibili] 未找到原语种字幕，已降级使用中文（可能为机翻）字幕；"
+            "如需原语种，请确认该视频是否提供了原语言字幕。"
+        )
     url = chosen.get("subtitle_url") or chosen.get("url")
     if not url:
-        return []
+        return [], ""
     if url.startswith("//"):
         url = "https:" + url
 
@@ -247,9 +297,9 @@ def _fetch_bilibili_subtitle(sub_info: dict, workdir: Optional[Path]) -> Tuple[L
     resp.raise_for_status()
     path.write_bytes(resp.content)
     segments = parse_bilibili_json(path)
-    # 信任 B站字幕自带的 lan 信号（ja/ko/en 等）作为权威语种，仅在缺失/未知时
-    # 回退到文本字符脚本判定——避免纯汉字日语/韩语被误判成中文（产品评审 P0）。
-    declared = _map_bili_lang(chosen.get("lan", ""))
+    # 交叉校验：用字幕【文本实际语种】纠正 B站常错的 lan 元数据，
+    # 避免「韩文摘要/中文全文」这类语种分裂（lan 标错时以文本为准）。
+    declared = _map_bili_lang(chosen.get("lan", ""), " ".join(s.text for s in segments))
     lang = declared or _detect_language(segments)
     # 中文（含繁体/台湾字幕）统一规范为简体中文
     if lang == "zh":
