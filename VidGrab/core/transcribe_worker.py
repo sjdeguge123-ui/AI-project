@@ -72,7 +72,10 @@ def main() -> int:
             compute_type=args.compute_type,
             chunk_sec=args.chunk_sec,
             resume_sec=args.resume or 0.0,
-            language=args.language or None,
+            # faster-whisper 不接受字符串 "auto" 作为 language（仅接受 None 或具体语种码如 "zh"），
+            # 而 config 默认 whisper.language="auto"。这里把 "auto"/空串/None 都归一为 None（自动检测），
+            # 避免 model.transcribe(language="auto") 抛 ValueError: 'auto' is not a valid language code。
+            language=None if (args.language in (None, "", "auto")) else args.language,
         )
         data = [
             {"start": float(s.start), "end": float(s.end), "text": s.text}

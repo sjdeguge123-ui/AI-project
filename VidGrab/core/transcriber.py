@@ -387,7 +387,9 @@ def _transcribe_local(
             "--chunk-sec", str(use_chunk_sec),
             "--output-json", str(json_path),
             "--resume", str(resume_sec),
-            "--language", str(language) if language else "",
+            # 注意：config 默认 whisper.language="auto"，而 faster-whisper 不接受字符串 "auto"
+            # （只接受 None 或具体语种码如 "zh"）。这里把 "auto" 归一为空串，worker 侧再转 None。
+            "--language", str(language) if (language and language != "auto") else "",
         ]
         print("   🔧 启动本地转录子进程（隔离 GPU 状态，避免崩溃拖垮主流程）...")
         proc = subprocess.Popen(
