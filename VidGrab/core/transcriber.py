@@ -32,6 +32,53 @@ try:
 except ImportError:
     psutil = None
 
+import atexit
+
+# ----------------------------------------------------------------------------
+# 转录子进程生命周期管理
+# ----------------------------------------------------------------------------
+# 根因：Windows 不会在父进程死亡时级联杀掉子进程。VidGrab 的转录跑在独立 worker 子进程
+# （core/transcribe_worker）里，若主进程被外部杀掉（agent 会话结束 / 终端关闭 / 崩溃），
+# worker 会遗留成孤儿、一直占着内存。下面用「模块级记录 + atexit + 控制台事件」三重兜底，
+# 保证主进程无论以何种方式退出，worker 都会被清掉。
+_ACTIVE_WORKER = None
+
+
+def _kill_active_worker() -> None:
+    """强制结束当前正在运行的转录 worker 子进程（若有）。"""
+    global _ACTIVE_WORKER
+    proc = _ACTIVE_WORKER
+    if proc is not None and proc.poll() is None:
+        try:
+            proc.kill()  # Windows TerminateProcess / POSIX SIGKILL，确保立即退出
+        except Exception:  # noqa: BLE001
+            pass
+    _ACTIVE_WORKER = None
+
+
+# 正常退出 / 未捕获异常 / Ctrl+C(KeyboardInterrupt 收尾) 都会走到 atexit。
+atexit.register(_kill_active_worker)
+
+
+if sys.platform == "win32":
+    try:
+        import ctypes
+
+        _kernel32 = ctypes.windll.kernel32
+
+        def _console_ctrl_handler(ctrl_type: int) -> int:
+            # 2=CLOSE / 5=LOGOFF / 6=SHUTDOWN：先杀 worker，再交回「已处理」让 Windows 终止本进程
+            if ctrl_type in (2, 5, 6):
+                _kill_active_worker()
+                return 1
+            # 0=CTRL_C 等其他信号：交回默认处理，保留既有 KeyboardInterrupt 行为
+            return 0
+
+        _HANDLER = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_uint)
+        _kernel32.SetConsoleCtrlHandler(_HANDLER(_console_ctrl_handler), True)
+    except Exception:  # noqa: BLE001
+        pass
+
 
 def _fmt_ts(sec) -> str:
     """把秒数格式化成「X分Y秒」，用于转录进度展示。"""
@@ -407,6 +454,8 @@ def _transcribe_local(
             cwd=str(project_root),
             env=env,
         )
+        # 记录活跃 worker，供 atexit / 控制台事件 / 看门狗在退出时强制清理，避免遗留孤儿进程
+        _ACTIVE_WORKER = proc
         # 实时转发子进程进度输出（含分块进度），并缓冲用于失败根因分类
         assert proc.stdout is not None
         child_log: list[str] = []
@@ -415,6 +464,8 @@ def _transcribe_local(
             print(s)
             child_log.append(s)
         rc = proc.wait()
+        # 本轮 worker 已结束（成功或失败），清空记录，避免 atexit 误杀已退出的进程
+        _ACTIVE_WORKER = None
 
         if rc == 0 and json_path.exists():
             try:

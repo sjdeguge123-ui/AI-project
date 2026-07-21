@@ -27,6 +27,7 @@ import os
 import shutil
 import subprocess
 import sys
+import atexit
 import tempfile
 import traceback
 from datetime import datetime
@@ -166,6 +167,64 @@ def _welcome() -> None:
 def _preflight() -> None:
     """环境自检：让用户对依赖状态心里有数，不阻塞。"""
     print("🔧 环境自检：依赖已自动就绪（含内置 ffmpeg），可直接处理有字幕/无字幕视频。\n")
+
+
+def _parent_alive_win() -> bool:
+    """Windows 下判断「启动者（agent / 终端）」是否还活着。
+
+    VidGrab 被 agent / 自动化 detached 启动后，Windows 不会在父进程死亡时级联杀子进程。
+    返回 False = 父进程已死，本进程已是被遗留的孤儿，应主动清理退出。
+    （Linux 下子进程会被 reparent 到 init，不存在此问题，调用方仅在 win32 时调用本函数。）
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        ppid = os.getppid()
+        if ppid <= 0:
+            return True  # 无法判定时保守认为活着
+        kernel32 = ctypes.windll.kernel32
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, ppid)
+        if not h:
+            return False  # 父进程不存在 = 已死
+        code = wintypes.DWORD()
+        kernel32.GetExitCodeProcess(h, ctypes.byref(code))
+        kernel32.CloseHandle(h)
+        return code.value == 259  # 259 = STILL_ACTIVE
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _start_parent_watchdog() -> None:
+    """仅 Windows + 非交互（agent / 管道）模式启动：父进程死亡则自清理并退出。
+
+    根因修复：本机曾出现 13 个 VidGrab 主进程被 agent 会话遗留成孤儿，一直占内存。
+    看门狗每 5 秒检测父进程存活，父死即杀掉转录 worker 子进程并退出，从源头杜绝孤儿。
+    交互终端模式（stdin 是 tty）不启用——关闭终端会触发控制台事件杀进程，且避免误杀。
+    """
+    if sys.platform != "win32":
+        return
+    if sys.stdin.isatty():
+        return
+    import threading
+    import time
+
+    def _loop() -> None:
+        while True:
+            try:
+                if not _parent_alive_win():
+                    print("[VidGrab] 检测到启动进程已退出，自动清理转录子进程并结束。", flush=True)
+                    try:
+                        transcriber._kill_active_worker()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    os._exit(0)
+            except Exception:  # noqa: BLE001
+                pass
+            time.sleep(5)
+
+    threading.Thread(target=_loop, daemon=True).start()
 
 
 def _select_page(url: str, sessdata: str, forced: int = None) -> int:
@@ -726,6 +785,10 @@ def _run_youtube_reserved(url: str, cfg) -> int:
 
 def main(argv=None) -> int:
     argv = argv if argv is not None else sys.argv[1:]
+
+    # 启动「父进程死亡看门狗」：被 agent/自动化 detached 启动时，若启动者退出则自清理，
+    # 杜绝孤儿进程（仅 Windows + 非交互模式生效，详见 _start_parent_watchdog）。
+    _start_parent_watchdog()
 
     # 解析可选参数（链接以外的开关）
     force_audio = False
