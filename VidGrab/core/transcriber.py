@@ -112,14 +112,15 @@ def _transcribe_api(audio_path: Path, api_key: str) -> List[Segment]:
     return segments
 
 
-def _load_whisper_model(model_path, device, compute_type, max_attempts: int = 3):
+def _load_whisper_model(model_path, device, compute_type, max_attempts: int = 5):
     """加载 WhisperModel，对瞬时内存分配失败（mkl_malloc / CUDA OOM）做有限重试。
 
     Windows 下 MKL / CUDA 的瞬时分配失败具有偶发性（空闲内存充足也会因碎片化失败），
-    重试通常能成功，避免「时好时坏、刚修好又崩」。返回模型对象；若全部重试失败则返回
-    最后一个异常对象（调用方据此判断是否需要回退 CPU 或报错）。
+    重试通常能成功，避免「时好时坏、刚修好又崩」。每次重试前 gc.collect() 降低内存碎片。
+    返回模型对象；若全部重试失败则返回最后一个异常对象（调用方据此判断是否需要回退）。
     """
 
+    import gc
     from faster_whisper import WhisperModel
 
     last_exc = None
@@ -129,6 +130,7 @@ def _load_whisper_model(model_path, device, compute_type, max_attempts: int = 3)
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
             if attempt < max_attempts:
+                gc.collect()
                 print(f"   ⚠️ 模型加载失败（第 {attempt}/{max_attempts} 次，疑似瞬时内存分配失败），3 秒后重试...")
                 _time.sleep(3)
     return last_exc
@@ -195,8 +197,10 @@ def _run_local_transcription(
     else:
         print(f"   🌐 首次运行需从 HuggingFace 下载 faster-whisper-{model_size} 模型，请保持网络畅通...")
 
+    import gc
+    gc.collect()
     print("   ⏳ 正在加载 faster-whisper 模型...")
-    model = _load_whisper_model(model_path, use_device, use_compute_type)
+    model = _load_whisper_model(model_path, use_device, use_compute_type, max_attempts=5)
     if isinstance(model, Exception):
         # 主设备（cuda）加载失败 → 回退 CPU 再重试
         if use_device == "cuda":
@@ -270,11 +274,15 @@ def _transcribe_local(audio_path: Path, model_size: str, device: str = "auto", c
         #    硬崩溃（STATUS_STACK_BUFFER_OVERRUN, exit 3221226505）。实测 40min 视频稳定通过。
         #  - CPU 路径再降 MKL/OpenMP 线程数，减少瞬时内存分配与线程冲突。
         env = os.environ.copy()
+        # GPU 修复：根治 Windows 下 CUDA 默认分配器显存碎片化（长视频中途/进程退出时硬崩）
         env["CT2_CUDA_ALLOCATOR"] = "cuda_malloc_async"
-        if use_device == "cpu":
-            env["OMP_NUM_THREADS"] = "1"
-            env["MKL_NUM_THREADS"] = "1"
-            env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+        # CPU 路径加固：强制 MKL/OpenMP 单线程 + 允许重复库 + 关闭 MKL 动态线程，
+        # 降低 mkl_malloc 瞬时分配失败概率。无条件设置（对 GPU 模式无害，且能压制
+        # GPU 模式下 MKL 的零星分配，避免「时好时坏」）。
+        env["OMP_NUM_THREADS"] = "1"
+        env["MKL_NUM_THREADS"] = "1"
+        env["MKL_DYNAMIC"] = "FALSE"
+        env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
         cmd = [
             sys.executable, "-u", "-m", "core.transcribe_worker",

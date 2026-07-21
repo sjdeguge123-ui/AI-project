@@ -355,15 +355,17 @@ def _make_workdir() -> Path:
     return d
 
 
-def _timed_input(prompt: str, timeout: float = 30) -> str:
-    """带超时的输入：超过 timeout 秒未输入则抛 TimeoutError（不阻塞程序结束）。
+def _timed_input(prompt: str, timeout: float = 100) -> str:
+    """带超时 + 倒计时显示的输入：超过 timeout 秒未输入则抛 TimeoutError。
 
-    用于交互式询问：用户迟迟不回复时应自动退出并清理，避免进程一直挂着。
+    用于交互式询问：用户迟迟不回复时自动退出并清理，避免进程一直挂着。
+    倒计时每秒刷新一行（用 \\r 回车覆盖），让用户清楚还剩多少时间。
     """
 
     import threading
+    import time
 
-    print(prompt, end="", flush=True)
+    print(prompt)
     box: dict = {}
 
     def _get() -> None:
@@ -374,7 +376,12 @@ def _timed_input(prompt: str, timeout: float = 30) -> str:
 
     th = threading.Thread(target=_get, daemon=True)
     th.start()
-    th.join(timeout)
+    deadline = time.time() + timeout
+    while th.is_alive() and time.time() < deadline:
+        remain = int(deadline - time.time())
+        print(f"\r   ⏳ 剩余 {remain:03d}s（输入任意内容即生效，超时自动退出）", end="", flush=True)
+        th.join(1)
+    print()  # 倒计时行收尾
     if th.is_alive():
         # 超时：丢弃这个等待中的 input 线程（daemon 会随进程退出）
         raise TimeoutError()
@@ -427,9 +434,9 @@ def _offer_other_versions(t, cfg, proxy: str, formats: list, first_mode: str, fi
         print("\n💡 已导出一版，是否还要其他版本？")
         print("   1. 详细   2. 自定义（关键词）   3. 全文文案   4. 不需要了，退出")
         try:
-            choice = _timed_input("请选择（1-4，默认 4 退出；30 秒无操作自动退出）：", timeout=30)
+            choice = _timed_input("请选择（1-4，默认 4 退出；100 秒无操作自动退出）：", timeout=100)
         except TimeoutError:
-            print("\n⏰ 30 秒未操作，自动退出。中间临时文件将在程序结束时清理。")
+            print("\n⏰ 100 秒未操作，自动退出。中间临时文件将在程序结束时清理。")
             return
         except (EOFError, KeyboardInterrupt):
             print("\n👋 已退出。")
