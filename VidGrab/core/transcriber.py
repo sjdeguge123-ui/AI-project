@@ -134,11 +134,18 @@ def _load_whisper_model(model_path, device, compute_type, max_attempts: int = 3)
     return last_exc
 
 
-def _run_local_transcription(audio_path: Path, model_size: str, device: str = "auto", compute_type: str = "auto") -> List[Segment]:
+def _run_local_transcription(
+    audio_path: Path,
+    model_size: str,
+    device: str = "auto",
+    compute_type: str = "auto",
+    chunk_sec: int = 120,
+) -> List[Segment]:
     """本地 faster-whisper 推理（实际执行体，运行在隔离子进程内）。
 
     device: auto（自动检测）| cpu | cuda
     compute_type: auto（GPU 默认 int8_float16，CPU 默认 int8）| float16 | int8 | int8_float16
+    chunk_sec: 每块转录秒数。GPU 用 2 分钟求速度；CPU 用 30 秒避免 MKL 大段分配失败。
 
     注意：此函数被 core/transcribe_worker.py 在独立子进程中调用，目的是把 GPU/CUDA
     状态完全隔离，避免 Windows 下 CTranslate2 模型析构时硬崩溃拖垮主流程。
@@ -181,6 +188,7 @@ def _run_local_transcription(audio_path: Path, model_size: str, device: str = "a
     else:
         use_compute_type = compute_type
     print(f"   ⚙️ 计算类型：{use_compute_type}（device={use_device}）")
+    print(f"   🧩 分块长度：{chunk_sec} 秒/块（{'GPU' if use_device == 'cuda' else 'CPU'} 模式）")
 
     if local_dir.exists():
         print(f"   📂 使用本地模型：{local_dir}")
@@ -213,7 +221,7 @@ def _run_local_transcription(audio_path: Path, model_size: str, device: str = "a
     # 改为：先解码成 16kHz mono numpy（33min 约 128MB），再按 CHUNK_SEC 秒切片逐块转录，
     # 每块特征数组只有几分钟大小（峰值降两个数量级），并按块起点偏移拼接时间戳。
     print("   🎙️ 开始转录，请稍候（长音频自动分块，期间会显示进度）...")
-    segments = _transcribe_chunked(model, wav_path)
+    segments = _transcribe_chunked(model, wav_path, chunk_sec=chunk_sec)
     return segments
 
 
@@ -223,26 +231,55 @@ def _transcribe_local(audio_path: Path, model_size: str, device: str = "auto", c
     把 GPU/CUDA 重活放进独立子进程（core/transcribe_worker.py），子进程退出时 CUDA 状态
     随之一并销毁，主流程继续 AI 摘要，彻底规避 Windows 下 CTranslate2 模型析构时的硬崩溃
     （表现为「转录完成却忽然回到提示符、无任何报错」）。
+
+    回退策略：
+      第 1 次：按 config 的 device（auto 则优先 GPU）
+      第 2 次：若 GPU 崩，强制 CPU + int8
+      第 3 次：若 CPU 也崩，CPU 单线程 + 30 秒小块（进一步降低 MKL 内存压力）
+      仍失败：提示用户改 whisper.mode: api
     """
 
     audio_path = Path(audio_path)
     json_path = audio_path.with_suffix(".segments.json")
     project_root = Path(__file__).parent.parent
 
-    cmd = [
-        sys.executable, "-u", "-m", "core.transcribe_worker",
-        "--audio-path", str(audio_path),
-        "--model-size", str(model_size),
-        "--device", str(device),
-        "--compute-type", str(compute_type),
-        "--output-json", str(json_path),
-    ]
-
-    max_runs = 2  # 子进程级重试：覆盖转录过程中偶发的瞬时分配失败
+    max_runs = 3
     last_err: Optional[Exception] = None
+    use_device = device
+    use_compute_type = compute_type
+    use_chunk_sec = 120  # GPU 或常规 CPU 用 2 分钟块
     for run_i in range(1, max_runs + 1):
         if run_i > 1:
             print(f"   🔁 重试本地转录子进程（第 {run_i}/{max_runs} 次）...")
+            # 若前一次走 GPU 路径硬崩溃，重试强制 CPU（牺牲速度换稳定）
+            if run_i == 2 and use_device in ("auto", "cuda"):
+                print("   🖥️ GPU 路径已崩溃，重试改用 CPU（更稳定，速度较慢）...")
+                use_device = "cpu"
+                use_compute_type = "int8"
+                use_chunk_sec = 120
+            # 若 CPU 也崩，进一步降到单线程 + 30 秒小块，避开 MKL 大段分配
+            if run_i == 3:
+                print("   🐢 CPU 路径仍异常，进一步限制单线程 + 30 秒小块重试...")
+                use_device = "cpu"
+                use_compute_type = "int8"
+                use_chunk_sec = 30
+
+        # CPU 路径时降低 MKL/OpenMP 线程数，减少瞬时内存分配与线程冲突
+        env = os.environ.copy()
+        if use_device == "cpu":
+            env["OMP_NUM_THREADS"] = "1"
+            env["MKL_NUM_THREADS"] = "1"
+            env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+        cmd = [
+            sys.executable, "-u", "-m", "core.transcribe_worker",
+            "--audio-path", str(audio_path),
+            "--model-size", str(model_size),
+            "--device", str(use_device),
+            "--compute-type", str(use_compute_type),
+            "--chunk-sec", str(use_chunk_sec),
+            "--output-json", str(json_path),
+        ]
         print("   🔧 启动本地转录子进程（隔离 GPU 状态，避免崩溃拖垮主流程）...")
         proc = subprocess.Popen(
             cmd,
@@ -253,6 +290,7 @@ def _transcribe_local(audio_path: Path, model_size: str, device: str = "auto", c
             encoding="utf-8",
             errors="replace",
             cwd=str(project_root),
+            env=env,
         )
         # 实时转发子进程进度输出（含分块进度），保持用户可见
         assert proc.stdout is not None
@@ -293,13 +331,13 @@ def _transcribe_local(audio_path: Path, model_size: str, device: str = "auto", c
     raise last_err
 
 
-# 单块时长（秒）：2 分钟。足够小以规避大额连续内存分配（decode_audio 整段 123MB /
-# STFT 整段数百 MB），又不至于块数过多。配合 wave 按块读取，峰值内存恒定在几十 MB。
-_CHUNK_SEC = 120
+# 单块采样率（固定 16kHz mono）
 _SAMPLE_RATE = 16000
 
+# 不再用固定 _CHUNK_SEC：GPU 默认 2 分钟求速度；CPU 回退时由 _transcribe_local 传入 30 秒小块。
 
-def _transcribe_chunked(model, wav_path: Path) -> List[Segment]:
+
+def _transcribe_chunked(model, wav_path: Path, chunk_sec: int = 120) -> List[Segment]:
     """按固定时长用标准库 wave 分块读取 PCM 并逐块转录，拼接时间戳。
 
     为什么必须按块「流式」读取，而不是 decode_audio 整段解码：
@@ -308,10 +346,11 @@ def _transcribe_chunked(model, wav_path: Path) -> List[Segment]:
     下，这两个「整段」操作都需要上百 MB 的【连续】主机内存，空闲内存波动/碎片化时会
     间歇性抛 numpy ArrayMemoryError（表现为「时好时坏、转录后自己结束」）。
 
-    改为：直接用标准库 wave 按块读取 16k mono PCM（每 2 分钟仅约 2-4MB），转 float32 后
-    逐块喂给 model.transcribe()，每次只处理几分钟，峰值内存恒定在几十 MB，无论视频多长都稳定。
+    改为：直接用标准库 wave 按块读取 16k mono PCM（每块仅约几 MB），转 float32 后
+    逐块喂给 model.transcribe()，每次只处理一小块，峰值内存恒定在几十 MB，无论视频多长都稳定。
     """
 
+    import gc
     import numpy as np
     import wave
 
@@ -326,7 +365,7 @@ def _transcribe_chunked(model, wav_path: Path) -> List[Segment]:
                 "请检查 _ensure_wav_16k_mono 是否生效，或改用 whisper.mode: api 云端转录。"
             )
 
-        chunk_frames = _CHUNK_SEC * fr
+        chunk_frames = chunk_sec * fr
         total_dur = nframes / fr
         n_chunks = max(1, (nframes + chunk_frames - 1) // chunk_frames)
 
@@ -343,7 +382,12 @@ def _transcribe_chunked(model, wav_path: Path) -> List[Segment]:
             # int16 PCM -> float32 in [-1, 1]（只读这一小块，约几 MB，绝不整段分配）
             audio_chunk = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
             try:
-                seg_gen, _info = model.transcribe(audio_chunk, beam_size=5, word_timestamps=False)
+                seg_gen, _info = model.transcribe(
+                    audio_chunk,
+                    beam_size=5,
+                    word_timestamps=False,
+                    condition_on_previous_text=False,  # 避免缓存/复用前一段文本，降低内存与错位风险
+                )
             except Exception as exc:  # noqa: BLE001
                 raise RuntimeError(
                     f"faster-whisper 转录过程出错（第 {ci + 1}/{n_chunks} 块）：{exc}\n"
@@ -371,6 +415,8 @@ def _transcribe_chunked(model, wav_path: Path) -> List[Segment]:
             done_dur = s1 / fr
             _dpct = int(done_dur / total_dur * 100) if total_dur else 100
             print(f"   ✅ 已完成第 {ci + 1}/{n_chunks} 块（累计 {_fmt_ts(done_dur)} / {_fmt_ts(total_dur)}，{_dpct}%）")
+            # 主动 GC，降低长音频多段情况下的内存碎片
+            gc.collect()
 
     return segments
 

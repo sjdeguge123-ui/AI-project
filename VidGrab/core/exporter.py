@@ -19,6 +19,8 @@ import re
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+from datetime import date
+
 from . import Summary, Transcript
 from .config import OutputConfig
 from .templates import render_summary_md
@@ -71,14 +73,20 @@ def _safe_title(transcript: Transcript, mode_label: str = "") -> str:
 
 
 def _resolve_save_dir(output: OutputConfig) -> Path:
-    """决定落盘目录：配置优先；相对路径相对项目根；未配置则用项目下 output/。"""
+    """决定落盘目录：默认项目 output/YYYYMMDD/；配置 save_path 时则 save_path/YYYYMMDD/。
 
+    按日期分组便于用户后续整理、回看历史输出，与常见的下载/日志习惯一致。
+    相对路径相对项目根；未配置则用项目下 output/YYYYMMDD/。
+    """
+
+    today = date.today().strftime("%Y%m%d")
     if output.save_path:
         d = Path(output.save_path)
         if not d.is_absolute():
             d = _PROJECT_ROOT / d
-        return d
-    return _PROJECT_ROOT / "output"
+    else:
+        d = _PROJECT_ROOT / "output"
+    return d / today
 
 
 def export_markdown(summary: Summary, output: OutputConfig, transcript: Transcript, mode_label: str = "") -> Path:

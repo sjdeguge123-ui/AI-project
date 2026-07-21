@@ -49,6 +49,7 @@ def _parse_args():
     p.add_argument("--model-size", required=True)
     p.add_argument("--device", default="auto")
     p.add_argument("--compute-type", default="auto")
+    p.add_argument("--chunk-sec", type=int, default=120)
     p.add_argument("--output-json", required=True)
     return p.parse_args()
 
@@ -65,6 +66,7 @@ def main() -> int:
             args.model_size,
             device=args.device,
             compute_type=args.compute_type,
+            chunk_sec=args.chunk_sec,
         )
         data = [
             {"start": float(s.start), "end": float(s.end), "text": s.text}
