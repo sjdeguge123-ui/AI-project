@@ -274,7 +274,7 @@ def _select_mode(forced: str = None, keywords: str = "") -> tuple:
     - 交互环境：列出三种模式让用户选，选「自定义」则进一步询问关键词。
     """
 
-    valid = {"concise", "detailed", "query"}
+    valid = {"concise", "detailed", "query", "fulltext"}
 
     # CLI 直接指定了模式
     if forced:
@@ -303,8 +303,9 @@ def _select_mode(forced: str = None, keywords: str = "") -> tuple:
     print("   1. 精简（默认）：只提炼核心大重点，内容脉络简洁")
     print("   2. 详细：在大重点基础上，把次重点也提取出来，内容更丰满")
     print("   3. 自定义：你输入关键词/一段话，只输出与关注点相关的重点")
+    print("   4. 全文文案：保留完整转录原文，按时间标注 [MM:SS]，仅做轻量概述")
     try:
-        choice = input("请选择（1/2/3，回车默认 1）：").strip()
+        choice = input("请选择（1/2/3/4，回车默认 1）：").strip()
     except (EOFError, KeyboardInterrupt):
         choice = ""
 
@@ -312,6 +313,8 @@ def _select_mode(forced: str = None, keywords: str = "") -> tuple:
         return "concise", ""
     if choice == "2":
         return "detailed", ""
+    if choice == "4":
+        return "fulltext", ""
 
     # 模式三：自定义关键词
     if choice == "3":
@@ -350,6 +353,114 @@ def _make_workdir() -> Path:
     d = base / f"run_{ts}_{os.getpid()}"
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def _timed_input(prompt: str, timeout: float = 30) -> str:
+    """带超时的输入：超过 timeout 秒未输入则抛 TimeoutError（不阻塞程序结束）。
+
+    用于交互式询问：用户迟迟不回复时应自动退出并清理，避免进程一直挂着。
+    """
+
+    import threading
+
+    print(prompt, end="", flush=True)
+    box: dict = {}
+
+    def _get() -> None:
+        try:
+            box["v"] = input()
+        except (EOFError, KeyboardInterrupt):
+            box["v"] = ""
+
+    th = threading.Thread(target=_get, daemon=True)
+    th.start()
+    th.join(timeout)
+    if th.is_alive():
+        # 超时：丢弃这个等待中的 input 线程（daemon 会随进程退出）
+        raise TimeoutError()
+    return (box.get("v") or "").strip()
+
+
+def _export_one(t, cfg, proxy: str, formats: list, mode: str, keywords: str = "") -> list:
+    """生成指定模式的摘要并导出，返回生成的文件路径列表。
+
+    供「首个版本」与「交互式追加其他版本」复用，避免重复下载/转录。
+    """
+
+    _MODE_LABEL = {
+        "concise": "精简（核心大重点）",
+        "detailed": "详细（大重点+次重点）",
+        "query": f"自定义（关注：{keywords}）",
+        "fulltext": "全文文案（带时间戳全文）",
+    }
+    mode_label = _short_mode_label(mode, keywords)
+    print(f"\n   内容模式：{_MODE_LABEL.get(mode, mode)}")
+
+    # ⏱️ AI 摘要预估时间（转录已完成，这里只估算 AI 摘要部分，提前告知用户）
+    if mode != "fulltext":
+        eta_ai = _estimate_ai_time(t.duration, cfg.ai.tier)
+        print(f"   ⏱️ 预计 AI 摘要耗时：{eta_ai}")
+
+    summary = summarizer.generate_summary(t, cfg.ai, proxy=proxy, mode=mode, query=keywords)
+
+    print(f"\n   正在导出：{', '.join(formats)} ...")
+    paths = exporter.export(summary, cfg.output, t, formats=formats, mode_label=mode_label)
+    print(f"\n🎉 完成！共导出 {len(paths)} 个文件：")
+    for p in paths:
+        print(f"   {p}")
+    if cfg.notify:
+        notify.notify(
+            f"VidGrab 完成：{t.title}\n摘要文档：{paths[0]}", cfg.notify
+        )
+    return paths
+
+
+def _offer_other_versions(t, cfg, proxy: str, formats: list, first_mode: str, first_keywords: str) -> None:
+    """导出成功后（仅 TTY 交互环境）询问是否还要其他版本。
+
+    用户明确不需要 / 超时未回复 → 退出（中间文件由主流程 finally 清理）。
+    用户选择其他版本 → 重新生成并导出，可继续追问。
+    """
+
+    tried = {first_mode}
+    while True:
+        print("\n💡 已导出一版，是否还要其他版本？")
+        print("   1. 详细   2. 自定义（关键词）   3. 全文文案   4. 不需要了，退出")
+        try:
+            choice = _timed_input("请选择（1-4，默认 4 退出；30 秒无操作自动退出）：", timeout=30)
+        except TimeoutError:
+            print("\n⏰ 30 秒未操作，自动退出。中间临时文件将在程序结束时清理。")
+            return
+        except (EOFError, KeyboardInterrupt):
+            print("\n👋 已退出。")
+            return
+
+        if choice in ("", "4"):
+            print("👋 已退出，无需其他版本。")
+            return
+        if choice == "1":
+            m, kw = "detailed", ""
+        elif choice == "2":
+            try:
+                kw = input("   请输入你想关注的关键词或一段话：").strip()
+            except (EOFError, KeyboardInterrupt):
+                kw = ""
+            if not kw:
+                continue
+            m = "query"
+        elif choice == "3":
+            m, kw = "fulltext", ""
+        else:
+            print("   ⚠️ 无效选择，请重试。")
+            continue
+
+        if m in tried:
+            print(f"   （{m} 已生成过，重新生成一次）")
+        tried.add(m)
+        try:
+            _export_one(t, cfg, proxy, formats, m, kw)
+        except Exception as exc:  # noqa: BLE001
+            print(f"   ❌ 生成失败：{exc}")
 
 
 def _run_bilibili(url: str, cfg, force_audio: bool = False, page_index: int | None = None, formats: str | None = None, mode: str | None = None, keywords: str = "") -> int:
@@ -427,28 +538,22 @@ def _run_bilibili(url: str, cfg, force_audio: bool = False, page_index: int | No
         # ⑤ 选择内容模式 + 摘要（AI）
         print(f"\n【步骤 ⑤】选择内容输出模式 + AI 生成结构化摘要（provider={cfg.ai.provider}）...")
         mode, keywords = _select_mode(forced=mode, keywords=keywords)
-        _MODE_LABEL = {"concise": "精简（核心大重点）", "detailed": "详细（大重点+次重点）", "query": f"自定义（关注：{keywords}）"}
-        print(f"   内容模式：{_MODE_LABEL.get(mode, mode)}")
-        mode_label = _short_mode_label(mode, keywords)
+        if mode not in ("concise", "detailed", "query", "fulltext"):
+            mode = "concise"
+        print(f"   内容模式：{mode}")
 
-        # ⏱️ AI 摘要预估时间（转录已完成，这里只估算 AI 摘要部分，提前告知用户）
-        eta_ai = _estimate_ai_time(t.duration, cfg.ai.tier)
-        print(f"\n⏱️ 预计 AI 摘要耗时：{eta_ai}")
-
-        summary = summarizer.generate_summary(t, cfg.ai, proxy=proxy, mode=mode, query=keywords)
-
-        # ⑥ 导出（多格式选择）
+        # ⑥ 导出格式（仅选一次，所有版本复用，避免重复询问）
         formats = _select_formats(forced=formats)
-        print(f"\n   正在导出：{', '.join(formats)} ...")
-        paths = exporter.export(summary, cfg.output, t, formats=formats, mode_label=mode_label)
+        if not formats:
+            formats = ["markdown"]
 
-        print(f"\n🎉 完成！共导出 {len(paths)} 个文件：")
-        for p in paths:
-            print(f"   {p}")
-        if cfg.notify:
-            notify.notify(
-                f"VidGrab 完成：{t.title}\n摘要文档：{paths[0]}", cfg.notify
-            )
+        # 首个版本：生成摘要 + 导出
+        _export_one(t, cfg, proxy, formats, mode, keywords)
+
+        # ⑦ 交互式询问是否还要其他版本（仅 TTY；非 TTY 直接结束，由 finally 清理中间文件）
+        if sys.stdin.isatty():
+            _offer_other_versions(t, cfg, proxy, formats, mode, keywords)
+
         success = True
         return 0
     except KeyboardInterrupt:
@@ -477,7 +582,7 @@ def _short_mode_label(mode: str, keywords: str = "") -> str:
         if len(kw) > 15:
             kw = kw[:15] + "…"
         return f"自定义-{kw}"
-    return {"concise": "精简", "detailed": "详细"}.get(mode, mode)
+    return {"concise": "精简", "detailed": "详细", "fulltext": "全文文案"}.get(mode, mode)
 
 
 def _estimate_transcribe_time(duration: float, whisper_cfg=None) -> str:

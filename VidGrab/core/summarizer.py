@@ -278,6 +278,70 @@ def _build_mode_instructions(mode: str, query: str) -> tuple:
     return mode_inst, query_inst
 
 
+def _build_full_text(segments: List[Segment], interval_sec: int = 180, max_chars: int = 30000) -> str:
+    """把转录片段拼成连续文案，每隔约 interval_sec 秒插入一个 [MM:SS] 时间戳。
+
+    用于「全文文案」模式：保留完整原文，仅用时间戳标出视频进度，方便回看定位。
+    max_chars 限制总长度（默认约 3 万字），超长则截断并提示。
+    """
+
+    buf: List[str] = []
+    last_ts = -1e9
+    chars = 0
+    for s in segments:
+        text = (s.text or "").strip()
+        if not text:
+            continue
+        if s.start - last_ts >= interval_sec:
+            buf.append(f"\n[{format_timestamp(s.start)}] ")
+            last_ts = s.start
+        buf.append(text)
+        chars += len(text) + 1
+        if chars >= max_chars:
+            buf.append("\n\n……（全文过长，已截断；完整内容见本地转录原文）")
+            break
+    return "".join(buf).strip()
+
+
+def _generate_overview(transcript, client, ai: AIConfig, proxy: str, rate_limiter) -> str:
+    """全文文案模式下，用一次轻量调用生成「内容概述」一句话（关键术语加粗）。
+
+    失败则回退用视频开头首句，保证基本信息不为空。
+    """
+
+    head = _build_chunk_text(transcript.segments)[:1500]
+    sys_p = (
+        "你是视频内容分析助手。请用一句简体中文（20-40字）概述整个视频在讲什么，"
+        "关键术语用 **加粗** 包裹。只输出这句话本身，不要 JSON、不要任何解释或引号。"
+    )
+    user = (
+        f"视频标题：{transcript.title}\n"
+        f"作者：{transcript.author or '未知'}\n"
+        f"总时长：{format_duration(transcript.duration)}\n\n"
+        f"以下是视频开头部分的文字稿（前 1500 字）：\n{head}\n\n概述："
+    )
+    try:
+        rate_limiter.wait_before_call()
+        resp = client.chat.completions.create(
+            model=ai.model,
+            messages=[
+                {"role": "system", "content": sys_p},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.3,
+            max_tokens=120,
+        )
+        ov = (resp.choices[0].message.content or "").strip().strip('"').strip()
+        return ov
+    except Exception:  # noqa: BLE001
+        # 回退：用开头首句
+        for s in transcript.segments:
+            t = (s.text or "").strip()
+            if t:
+                return t[:60]
+        return ""
+
+
 def generate_summary(
     transcript: Transcript,
     ai: Optional[AIConfig] = None,
@@ -310,6 +374,26 @@ def generate_summary(
     rate_limiter = RateLimiter(tier=ai.tier, provider=ai.provider, model=ai.model)
     if ai.tier == "free":
         rate_limiter.notify_if_free()
+
+    # 全文文案模式：不调 AI 分章，直接输出带时间戳的连续转录文案（内容概述仍用一次轻量调用生成）
+    if mode == "fulltext":
+        full_text = _build_full_text(transcript.segments)
+        try:
+            overview = _generate_overview(transcript, client, ai, proxy, rate_limiter)
+        except Exception:  # noqa: BLE001
+            overview = ""
+        return Summary(
+            title=transcript.title,
+            source=transcript.platform.label,
+            author=transcript.author,
+            publish_time=transcript.publish_time,
+            duration_text=format_duration(transcript.duration),
+            content_overview=overview,
+            detailed=[],
+            golden_quotes=[],
+            full_text=full_text,
+            mode_label="全文文案",
+        )
 
     mode_inst, query_inst = _build_mode_instructions(mode, query)
     chunk_system = _CHUNK_SYSTEM_PROMPT.format(mode_instruction=mode_inst, query_instruction=query_inst)

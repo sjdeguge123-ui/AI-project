@@ -104,6 +104,21 @@ def _mock_transcript() -> Transcript:
     )
 
 
+def _mock_summary_fulltext() -> Summary:
+    return Summary(
+        title="新用户模拟·机器学习三大类",
+        source="哔哩哔哩",
+        author="tester",
+        publish_time="2026-07-20",
+        duration_text="00:02:30",
+        content_overview="本视频介绍**机器学习**的三大类别。",
+        detailed=[],
+        golden_quotes=[],
+        full_text="[00:00] 大家好，今天讲**机器学习**。\n[01:00] 第一种是**监督学习**，需要标签。\n[02:00] 第二种是**无监督学习**，例如**聚类**。",
+        mode_label="全文文案",
+    )
+
+
 # ────────────────────────────── 各项检查 ──────────────────────────────
 def check_dependencies() -> None:
     import importlib
@@ -253,6 +268,29 @@ def check_pdf_chinese() -> None:
         _record("9. PDF 中文渲染正确", False, f"异常：{e}")
 
 
+def check_export_fulltext(tmp_out: Path) -> None:
+    summary = _mock_summary_fulltext()
+    t = _mock_transcript()
+    out = OutputConfig(save_path=str(tmp_out))
+    fmts = ["markdown", "html", "docx", "pdf", "image"]
+    try:
+        paths = core_exporter.export(summary, out, t, formats=fmts)
+        exist = [p for p in paths if Path(p).exists() and Path(p).stat().st_size > 0]
+        ok = len(exist) == len(fmts)
+        _record("8b. 全文文案导出（full_text 模式 md/html/docx/pdf/image 均落盘）", ok,
+                f"{len(exist)}/{len(fmts)} 成功")
+        # 校验 md 含时间戳、不含内容脉络表格
+        md_path = next((p for p in exist if str(p).lower().endswith(".md")), None)
+        if md_path:
+            txt = Path(md_path).read_text(encoding="utf-8")
+            has_ts = "[00:00]" in txt or "[01:00]" in txt
+            no_table = "| 时间 |" not in txt
+            _record("8c. 全文文案 MD 结构正确（含时间戳、无内容脉络表）", has_ts and no_table,
+                    f"has_ts={has_ts}, no_table={no_table}")
+    except Exception as e:  # noqa: BLE001
+        _record("8b. 全文文案导出", False, f"异常：{e}")
+
+
 def check_returning_user_idempotent(tmp_cfg: Path, tmp_example: Path) -> None:
     core_auth._config_path = lambda: tmp_cfg  # type: ignore
     core_auth._config_example_path = lambda: tmp_example  # type: ignore
@@ -299,6 +337,7 @@ def main() -> int:
         check_platform_detection()
         check_export_all_formats(tmp_out)
         check_pdf_chinese()
+        check_export_fulltext(tmp_out)
 
         print("\n—— 多次使用（returning user）——")
         check_returning_user_idempotent(tmp_cfg, real_example)

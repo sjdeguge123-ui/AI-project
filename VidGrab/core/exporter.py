@@ -23,7 +23,7 @@ from datetime import date
 
 from . import Summary, Transcript
 from .config import OutputConfig
-from .templates import render_summary_md
+from .templates import render_summary_md, _TS_RE, _render_full_text_html
 
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -107,6 +107,9 @@ def _build_html(summary: Summary) -> str:
 
     md_text = render_summary_md(summary)
     html_body = md.markdown(md_text, extensions=["tables", "fenced_code"])
+    # 全文文案模式：把时间戳 [[MM:SS]] 标红，与关键词红色风格一致
+    if summary.full_text:
+        html_body = _render_full_text_html(html_body)
     # 基本样式：中文友好、表格美观、金句高亮
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -240,6 +243,11 @@ def export_pdf(summary: Summary, output: OutputConfig, transcript: Transcript, m
             text,
         )
 
+    def _md_fulltext_pdf(text: str) -> str:
+        """全文文案专用：关键词加粗 + 时间戳 [MM:SS] 标红加粗。"""
+        h = _md_bold_to_html(text)
+        return _TS_RE.sub(r'<font color="#e74c3c"><b>[\1]</b></font>', h)
+
     story = []
 
     # 标题
@@ -260,8 +268,15 @@ def export_pdf(summary: Summary, output: OutputConfig, transcript: Transcript, m
         story.append(p)
     story.append(Spacer(1, 8))
 
-    # 内容脉络表格
-    story.append(Paragraph("内容脉络", h2_style))
+    # 内容脉络表格 / 全文文案
+    if summary.full_text:
+        story.append(Paragraph("全文文案", h2_style))
+        for para in summary.full_text.split("\n"):
+            if para.strip():
+                story.append(Paragraph(_md_fulltext_pdf(para), body_style))
+        story.append(Spacer(1, 12))
+    else:
+        story.append(Paragraph("内容脉络", h2_style))
     if summary.detailed:
         # 列宽：时间 12%，核心要点 20%，内容 56%，备注 12%
         col_widths = [USABLE_W * 0.12, USABLE_W * 0.20, USABLE_W * 0.56, USABLE_W * 0.12]
@@ -298,7 +313,7 @@ def export_pdf(summary: Summary, output: OutputConfig, transcript: Transcript, m
     else:
         story.append(Paragraph("（暂无）", body_style))
 
-    story.append(Spacer(1, 12))
+        story.append(Spacer(1, 12))
 
     # 金句
     story.append(Paragraph("金句", h2_style))
@@ -338,6 +353,41 @@ def _add_formatted_runs(paragraph, text: str) -> None:
             run.bold = True
 
 
+def _add_rich_runs_docx(paragraph, text: str, keyword_color=None) -> None:
+    """Word 富文本：同时处理 **加粗** 与 [MM:SS] 时间戳（时间戳红色加粗）。
+
+    用于全文文案模式：时间戳标红，关键词加粗。
+    """
+
+    import re
+
+    if keyword_color is None:
+        from docx.shared import RGBColor
+        keyword_color = RGBColor(0xE7, 0x4C, 0x3C)
+
+    pattern = re.compile(r"\*\*(.+?)\*\*|\[(\d{1,2}:\d{2}(?::\d{2})?)\]")
+    pos = 0
+    for m in pattern.finditer(text):
+        if m.start() > pos:
+            paragraph.add_run(text[pos:m.start()])
+        if m.group(1):
+            r = paragraph.add_run(m.group(1))
+            r.bold = True
+        else:
+            r = paragraph.add_run("[" + m.group(2) + "]")
+            r.bold = True
+            r.font.color.rgb = keyword_color
+        pos = m.end()
+    if pos < len(text):
+        paragraph.add_run(text[pos:])
+
+
+def _ts_to_bold_markup(text: str) -> str:
+    """图片导出用：把 [MM:SS] 包成 **...** 让 draw_rich 用关键词红色渲染时间戳。"""
+
+    return _TS_RE.sub(r"**[\1]**", text)
+
+
 def export_docx(summary: Summary, output: OutputConfig, transcript: Transcript, mode_label: str = "") -> Path:
     """渲染成 Word (.docx) 文件，返回路径。"""
 
@@ -365,28 +415,35 @@ def export_docx(summary: Summary, output: OutputConfig, transcript: Transcript, 
         run.bold = True
         _add_formatted_runs(p, value)
 
-    # 内容脉络
-    doc.add_heading("内容脉络", level=2)
-    if summary.detailed:
-        table = doc.add_table(rows=1, cols=4)
-        table.style = "Table Grid"
-        hdr = table.rows[0].cells
-        for i, header in enumerate(["时间", "核心要点", "内容", "备注"]):
-            hdr[i].text = header
-            for paragraph in hdr[i].paragraphs:
-                for run in paragraph.runs:
-                    run.bold = True
-        for row in summary.detailed:
-            cells = table.add_row().cells
-            cells[0].text = row.timestamp
-            # point 和 content 可能含 **加粗** 标记，需解析
-            p1 = cells[1].paragraphs[0]
-            _add_formatted_runs(p1, row.point)
-            p2 = cells[2].paragraphs[0]
-            _add_formatted_runs(p2, row.content)
-            cells[3].text = row.remark or ""
+    # 内容脉络 / 全文文案
+    if summary.full_text:
+        doc.add_heading("全文文案", level=2)
+        for para in summary.full_text.split("\n"):
+            if para.strip():
+                p = doc.add_paragraph()
+                _add_rich_runs_docx(p, para)
     else:
-        doc.add_paragraph("（暂无）")
+        doc.add_heading("内容脉络", level=2)
+        if summary.detailed:
+            table = doc.add_table(rows=1, cols=4)
+            table.style = "Table Grid"
+            hdr = table.rows[0].cells
+            for i, header in enumerate(["时间", "核心要点", "内容", "备注"]):
+                hdr[i].text = header
+                for paragraph in hdr[i].paragraphs:
+                    for run in paragraph.runs:
+                        run.bold = True
+            for row in summary.detailed:
+                cells = table.add_row().cells
+                cells[0].text = row.timestamp
+                # point 和 content 可能含 **加粗** 标记，需解析
+                p1 = cells[1].paragraphs[0]
+                _add_formatted_runs(p1, row.point)
+                p2 = cells[2].paragraphs[0]
+                _add_formatted_runs(p2, row.content)
+                cells[3].text = row.remark or ""
+        else:
+            doc.add_paragraph("（暂无）")
 
     # 金句
     doc.add_heading("金句", level=2)
@@ -611,33 +668,45 @@ def export_image(summary: Summary, output: OutputConfig, transcript: Transcript,
         y += max(h, F_INFO.size + 8) + 4
     y += 8
 
-    # 内容脉络
+    # 内容脉络 / 全文文案
     y += F_H2.size + 12
 
-    # 表格列边界
-    v_lines = [TABLE_X + i * BORDER + sum(COLS[:i]) + 2 * i * CELL_PAD_X for i in range(len(COLS) + 1)]
-
-    # 表头
-    table_header_y = y
-    header_h = F_HEADER.size + 2 * CELL_PAD_Y
-    y += header_h
-
-    # 数据行
-    row_specs = []
-    if summary.detailed:
-        for r in summary.detailed:
-            contents = [r.timestamp or "", r.point or "", r.content or "", r.remark or ""]
-            heights = []
-            for i, content in enumerate(contents):
-                h = draw_rich(dm, 0, 0, content, F_BODY, FG, KEYWORD, COLS[i], F_BODY.size + 7)
-                heights.append(h)
-            row_h = max(heights) + 2 * CELL_PAD_Y
-            row_specs.append((r, row_h))
-            y += row_h
+    fulltext_ops: list = []
+    if summary.full_text:
+        # 全文文案：按行渲染，时间戳标红（用 ** 包裹让 draw_rich 着色）
+        for para in summary.full_text.split("\n"):
+            if not para.strip():
+                continue
+            pt = _ts_to_bold_markup(para)
+            h = draw_rich(dm, 0, 0, pt, F_BODY, FG, KEYWORD, CW, F_BODY.size + 7)
+            fulltext_ops.append((pt, h))
+            y += h + 6
+        y += 8
     else:
-        y += F_BODY.size + 8
+        # 表格列边界
+        v_lines = [TABLE_X + i * BORDER + sum(COLS[:i]) + 2 * i * CELL_PAD_X for i in range(len(COLS) + 1)]
 
-    y += 8
+        # 表头
+        table_header_y = y
+        header_h = F_HEADER.size + 2 * CELL_PAD_Y
+        y += header_h
+
+        # 数据行
+        row_specs = []
+        if summary.detailed:
+            for r in summary.detailed:
+                contents = [r.timestamp or "", r.point or "", r.content or "", r.remark or ""]
+                heights = []
+                for i, content in enumerate(contents):
+                    h = draw_rich(dm, 0, 0, content, F_BODY, FG, KEYWORD, COLS[i], F_BODY.size + 7)
+                    heights.append(h)
+                row_h = max(heights) + 2 * CELL_PAD_Y
+                row_specs.append((r, row_h))
+                y += row_h
+        else:
+            y += F_BODY.size + 8
+
+        y += 8
 
     # 金句
     y += F_H2.size + 12
@@ -685,62 +754,68 @@ def export_image(summary: Summary, output: OutputConfig, transcript: Transcript,
         y += max(h, F_INFO.size + 8) + 4
     y += 8
 
-    # 内容脉络
-    d.text((PAD, y), "内容脉络", font=F_H2, fill=ACCENT_DARK)
+    # 内容脉络 / 全文文案
+    d.text((PAD, y), "全文文案" if summary.full_text else "内容脉络", font=F_H2, fill=ACCENT_DARK)
     y += F_H2.size + 12
 
-    # 表格
-    if summary.detailed:
-        # 表头背景
-        d.rectangle(
-            [v_lines[0] + BORDER, table_header_y + BORDER, v_lines[-1] - BORDER, table_header_y + header_h - BORDER],
-            fill=TABLE_HEADER_BG,
-        )
-        # 表头文字
-        for i, htext in enumerate(HEADERS):
-            d.text(
-                (v_lines[i] + BORDER + CELL_PAD_X, table_header_y + BORDER + CELL_PAD_Y),
-                htext,
-                font=F_HEADER,
-                fill=FG,
-            )
-
-        # 数据行
-        h_lines = [table_header_y, table_header_y + header_h]
-        for _r, row_h in row_specs:
-            h_lines.append(h_lines[-1] + row_h)
-
-        row_y = table_header_y + header_h
-        for idx, (r, row_h) in enumerate(row_specs):
-            bg = TABLE_ROW_EVEN if idx % 2 == 0 else BG
-            d.rectangle(
-                [v_lines[0] + BORDER, row_y + BORDER, v_lines[-1] - BORDER, row_y + row_h - BORDER],
-                fill=bg,
-            )
-            contents = [r.timestamp or "", r.point or "", r.content or "", r.remark or ""]
-            for i, content in enumerate(contents):
-                draw_rich(
-                    d,
-                    v_lines[i] + BORDER + CELL_PAD_X,
-                    row_y + BORDER + CELL_PAD_Y,
-                    content,
-                    F_BODY,
-                    FG,
-                    KEYWORD,
-                    COLS[i],
-                    F_BODY.size + 7,
-                )
-            row_y += row_h
-
-        # 表格边框
-        for x_line in v_lines:
-            d.line([(x_line, table_header_y), (x_line, h_lines[-1])], fill=TABLE_BORDER, width=BORDER)
-        for y_line in h_lines:
-            d.line([(TABLE_X, y_line), (TABLE_X + TABLE_W, y_line)], fill=TABLE_BORDER, width=BORDER)
-        y = h_lines[-1] + 8
+    if summary.full_text:
+        for pt, h in fulltext_ops:
+            draw_rich(d, PAD, y, pt, F_BODY, FG, KEYWORD, CW, F_BODY.size + 7)
+            y += h + 6
+        y += 8
     else:
-        d.text((PAD, y), "（暂无）", font=F_BODY, fill=MUTED)
-        y += F_BODY.size + 8
+        # 表格
+        if summary.detailed:
+            # 表头背景
+            d.rectangle(
+                [v_lines[0] + BORDER, table_header_y + BORDER, v_lines[-1] - BORDER, table_header_y + header_h - BORDER],
+                fill=TABLE_HEADER_BG,
+            )
+            # 表头文字
+            for i, htext in enumerate(HEADERS):
+                d.text(
+                    (v_lines[i] + BORDER + CELL_PAD_X, table_header_y + BORDER + CELL_PAD_Y),
+                    htext,
+                    font=F_HEADER,
+                    fill=FG,
+                )
+
+            # 数据行
+            h_lines = [table_header_y, table_header_y + header_h]
+            for _r, row_h in row_specs:
+                h_lines.append(h_lines[-1] + row_h)
+
+            row_y = table_header_y + header_h
+            for idx, (r, row_h) in enumerate(row_specs):
+                bg = TABLE_ROW_EVEN if idx % 2 == 0 else BG
+                d.rectangle(
+                    [v_lines[0] + BORDER, row_y + BORDER, v_lines[-1] - BORDER, row_y + row_h - BORDER],
+                    fill=bg,
+                )
+                contents = [r.timestamp or "", r.point or "", r.content or "", r.remark or ""]
+                for i, content in enumerate(contents):
+                    draw_rich(
+                        d,
+                        v_lines[i] + BORDER + CELL_PAD_X,
+                        row_y + BORDER + CELL_PAD_Y,
+                        content,
+                        F_BODY,
+                        FG,
+                        KEYWORD,
+                        COLS[i],
+                        F_BODY.size + 7,
+                    )
+                row_y += row_h
+
+            # 表格边框
+            for x_line in v_lines:
+                d.line([(x_line, table_header_y), (x_line, h_lines[-1])], fill=TABLE_BORDER, width=BORDER)
+            for y_line in h_lines:
+                d.line([(TABLE_X, y_line), (TABLE_X + TABLE_W, y_line)], fill=TABLE_BORDER, width=BORDER)
+            y = h_lines[-1] + 8
+        else:
+            d.text((PAD, y), "（暂无）", font=F_BODY, fill=MUTED)
+            y += F_BODY.size + 8
 
     # 金句
     d.text((PAD, y), "金句", font=F_H2, fill=ACCENT_DARK)
