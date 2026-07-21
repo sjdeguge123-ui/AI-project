@@ -149,6 +149,11 @@ def _set_proxy_env(proxy: str) -> None:
         os.environ["HTTPS_PROXY"] = proxy
 
 
+def _title_prefix(title: str) -> str:
+    """交互提示前缀：有标题时带《标题》，便于连续处理多个视频时区分上下文。"""
+    return f"关于《{title}》：" if title else ""
+
+
 def _welcome() -> None:
     """新手开场白：一句话说清产出格式，不展示详细流程。"""
     print("=" * 60)
@@ -212,7 +217,7 @@ def _select_page(url: str, sessdata: str, forced: int = None) -> int:
             return 0
 
 
-def _select_formats(forced: str = None) -> list:
+def _select_formats(forced: str = None, title: str = "") -> list:
     """选择输出格式（可多选）。返回格式列表。
 
     - forced 不为 None：解析 --formats 指定的逗号列表（如 "markdown,html"），不阻塞；
@@ -235,7 +240,10 @@ def _select_formats(forced: str = None) -> list:
     if not sys.stdin.isatty():
         return ["markdown"]
 
-    print("\n【步骤 ⑥】选择输出格式")
+    if title:
+        print(f"\n【步骤 ⑥】关于《{title}》，选择输出格式")
+    else:
+        print("\n【步骤 ⑥】选择输出格式")
     print("   支持的格式：")
     print("     1. Markdown (.md)  —— 通用，推荐")
     print("     2. HTML (.html)    —— 可在浏览器打开，样式美观")
@@ -261,7 +269,7 @@ def _select_formats(forced: str = None) -> list:
     return formats or ["markdown"]
 
 
-def _select_mode(forced: str = None, keywords: str = "") -> tuple:
+def _select_mode(forced: str = None, keywords: str = "", title: str = "") -> tuple:
     """选择内容输出模式。返回 (mode, keywords)。
 
     三种模式（用户需求）：
@@ -287,19 +295,22 @@ def _select_mode(forced: str = None, keywords: str = "") -> tuple:
                 mode = "detailed"
             else:
                 try:
-                    kw = input("请输入你想关注的关键词或一段话（回车放弃→退回详细）：").strip()
+                    kw = input(_title_prefix(title) + "请输入你想关注的关键词或一段话（回车放弃→退回精简（默认））：").strip()
                 except (EOFError, KeyboardInterrupt):
                     kw = ""
                 keywords = kw
                 if not keywords:
-                    mode = "detailed"
+                    mode = "concise"
         return mode, keywords
 
     # 非交互环境默认 concise
     if not sys.stdin.isatty():
         return "concise", ""
 
-    print("\n【步骤 ⑤-1】选择内容输出模式")
+    if title:
+        print(f"\n【步骤 ⑤-1】关于《{title}》视频，选择内容输出模式")
+    else:
+        print("\n【步骤 ⑤-1】选择内容输出模式")
     print("   1. 精简（默认）：只提炼核心大重点，内容脉络简洁")
     print("   2. 详细：在大重点基础上，把次重点也提取出来，内容更丰满")
     print("   3. 自定义：你输入关键词/一段话，只输出与关注点相关的重点")
@@ -319,11 +330,11 @@ def _select_mode(forced: str = None, keywords: str = "") -> tuple:
     # 模式三：自定义关键词
     if choice == "3":
         try:
-            kw = input("请输入你想关注的关键词或一段话（回车放弃→退回详细）：").strip()
+            kw = input(_title_prefix(title) + "请输入你想关注的关键词或一段话（回车放弃→退回精简（默认））：").strip()
         except (EOFError, KeyboardInterrupt):
             kw = ""
         if not kw:
-            return "detailed", ""
+            return "concise", ""
         return "query", kw
 
     # 非法输入退回 concise
@@ -422,7 +433,7 @@ def _export_one(t, cfg, proxy: str, formats: list, mode: str, keywords: str = ""
     return paths
 
 
-def _offer_other_versions(t, cfg, proxy: str, formats: list, first_mode: str, first_keywords: str) -> None:
+def _offer_other_versions(t, cfg, proxy: str, formats: list, first_mode: str, first_keywords: str, title: str = "") -> None:
     """导出成功后（仅 TTY 交互环境）询问是否还要其他版本。
 
     用户明确不需要 / 超时未回复 → 退出（中间文件由主流程 finally 清理）。
@@ -431,10 +442,16 @@ def _offer_other_versions(t, cfg, proxy: str, formats: list, first_mode: str, fi
 
     tried = {first_mode}
     while True:
-        print("\n💡 已导出一版，是否还要其他版本？")
+        head = f"《{title}》" if title else ""
+        print(f"\n💡 {head}已导出一版，是否还要其他版本？")
         print("   1. 详细   2. 自定义（关键词）   3. 全文文案   4. 不需要了，退出")
         try:
-            choice = _timed_input("请选择（1-4，默认 4 退出；100 秒无操作自动退出）：", timeout=100)
+            prompt = (
+                f"《{title}》请选择（1-4，默认 4 退出；100 秒无操作自动退出）："
+                if title else
+                "请选择（1-4，默认 4 退出；100 秒无操作自动退出）："
+            )
+            choice = _timed_input(prompt, timeout=100)
         except TimeoutError:
             print("\n⏰ 100 秒未操作，自动退出。中间临时文件将在程序结束时清理。")
             return
@@ -449,7 +466,7 @@ def _offer_other_versions(t, cfg, proxy: str, formats: list, first_mode: str, fi
             m, kw = "detailed", ""
         elif choice == "2":
             try:
-                kw = input("   请输入你想关注的关键词或一段话：").strip()
+                kw = input("   " + _title_prefix(title) + "请输入你想关注的关键词或一段话：").strip()
             except (EOFError, KeyboardInterrupt):
                 kw = ""
             if not kw:
@@ -544,13 +561,13 @@ def _run_bilibili(url: str, cfg, force_audio: bool = False, page_index: int | No
 
         # ⑤ 选择内容模式 + 摘要（AI）
         print(f"\n【步骤 ⑤】选择内容输出模式 + AI 生成结构化摘要（provider={cfg.ai.provider}）...")
-        mode, keywords = _select_mode(forced=mode, keywords=keywords)
+        mode, keywords = _select_mode(forced=mode, keywords=keywords, title=t.title)
         if mode not in ("concise", "detailed", "query", "fulltext"):
             mode = "concise"
         print(f"   内容模式：{mode}")
 
         # ⑥ 导出格式（仅选一次，所有版本复用，避免重复询问）
-        formats = _select_formats(forced=formats)
+        formats = _select_formats(forced=formats, title=t.title)
         if not formats:
             formats = ["markdown"]
 
@@ -559,7 +576,7 @@ def _run_bilibili(url: str, cfg, force_audio: bool = False, page_index: int | No
 
         # ⑦ 交互式询问是否还要其他版本（仅 TTY；非 TTY 直接结束，由 finally 清理中间文件）
         if sys.stdin.isatty():
-            _offer_other_versions(t, cfg, proxy, formats, mode, keywords)
+            _offer_other_versions(t, cfg, proxy, formats, mode, keywords, title=t.title)
 
         success = True
         return 0

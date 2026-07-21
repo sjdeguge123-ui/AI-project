@@ -361,15 +361,32 @@ def setup_ai(force_prompt: bool = False):
     ).strip()
     tier = "paid" if tier_input == "2" else "free"
 
+    # 自动探测（覆盖/修正用户自报）：OpenAI/DeepSeek 直查、SiliconFlow 模型启发式、Ollama 恒付费
+    # 探测失败一律回退用户自报的 tier，不阻塞；用户充值后重跑即自动升级。
+    try:
+        from .tier_probe import detect_tier
+        detected = detect_tier(
+            _config.AIConfig(
+                provider=prov["provider"], api_key=key, model=model,
+                base_url=prov["base_url"], tier=tier,
+            ),
+            proxy="",
+        )
+    except Exception:  # noqa: BLE001
+        detected = tier
+
     _patch_config({
         "ai": {
             "provider": prov["provider"],
             "api_key": key,
             "model": model,
             "base_url": prov["base_url"],
-            "tier": tier,
+            "tier": detected,
         }
     })
-    print(f"✅ 已保存 {prov['provider']} 配置到 config/config.yaml，下次运行免填。")
+    if detected == "paid":
+        print("✅ 已自动检测到【付费】额度，已解除限速，配置已保存到 config/config.yaml，下次运行免填。")
+    else:
+        print("✅ 已保存配置（未检测到付费额度，保持免费限速；如已充值，重跑即自动升级），下次运行免填。")
     # 返回更新后的配置
     return _config.load_config().ai

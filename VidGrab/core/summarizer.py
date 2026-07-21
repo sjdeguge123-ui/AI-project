@@ -30,7 +30,9 @@ from .ratelimit import RateLimiter
 
 
 # 单块摘要的系统提示：按【内容逻辑】分章，而非按时间平铺
-_CHUNK_SYSTEM_PROMPT = """你是一个专业的视频内容分析助手。用户给你一段带时间戳的视频文字稿（可能来自字幕或语音转录），这是**整个视频的其中一段**。
+_CHUNK_SYSTEM_PROMPT = """{language_instruction}
+
+你是一个专业的视频内容分析助手。用户给你一段带时间戳的视频文字稿（可能来自字幕或语音转录），这是**整个视频的其中一段**。
 请按【内容逻辑】把本段整理成若干「章节」，输出合法 JSON 对象，且只包含以下字段：
 
 {{
@@ -55,7 +57,9 @@ _CHUNK_SYSTEM_PROMPT = """你是一个专业的视频内容分析助手。用户
 
 
 # 合并阶段的系统提示：把各段「分章草稿」合并成全片稳定的逻辑章节
-_MERGE_SYSTEM_PROMPT = """你是一个视频总结助手。用户给你一整段视频按时间顺序的「分章草稿」（来自各段摘要合并，可能在段边界处把同一话题切开了）。
+_MERGE_SYSTEM_PROMPT = """{language_instruction}
+
+你是一个视频总结助手。用户给你一整段视频按时间顺序的「分章草稿」（来自各段摘要合并，可能在段边界处把同一话题切开了）。
 请输出整片最终的结构化摘要，必须是合法 JSON 对象，且只包含以下字段：
 
 {{
@@ -196,6 +200,86 @@ def _parse_json(obj_text: str) -> dict:
     raise ValueError(f"AI 返回的摘要不是合法 JSON：{obj_text[:200]}")
 
 
+def _raw_content(raw) -> str:
+    """从 with_raw_response 的返回里稳定取出 message content 文本。
+
+    兼容不同 openai SDK 版本：raw.parse() 可能直接返回 ChatCompletion，
+    也可能返回带 .data 的 ParsedResponse；极端情况下退化为直接解析原始 JSON。
+    """
+
+    try:
+        parsed = raw.parse()
+        completion = getattr(parsed, "data", parsed)
+        return (completion.choices[0].message.content or "")
+    except Exception:  # noqa: BLE001
+        pass
+    # 兜底：直接解析原始响应体
+    try:
+        import json
+        obj = json.loads(raw.content.decode("utf-8"))
+        return (obj["choices"][0]["message"]["content"] or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _language_instruction(language: str) -> str:
+    """根据视频语种生成「输出语言跟随视频」的指令片段。
+
+    中文视频强制简体中文；英文视频用英文；其余（auto/空）保持中文兜底。
+    """
+
+    lang = (language or "").lower()
+    if lang == "en":
+        return "全部用英语输出（与视频语言一致）。"
+    # 默认中文（含 zh / auto / 空 / 其他未知）
+    return "全部用简体中文输出（与视频语言一致）。"
+
+
+# 中文（CJK）常用标点；用于判断转录文本是否已具备基本断句标点
+_CJK_PUNCT = set("，。、；：！？“”‘’（）《》—…·")
+
+
+def _needs_punctuation(text: str) -> bool:
+    """文本中基本没有 CJK 标点时才需要补标点。"""
+
+    return not any(ch in _CJK_PUNCT for ch in (text or ""))
+
+
+def _restore_punctuation(text: str, client, ai: AIConfig, proxy: str = "") -> str:
+    """轻量标点恢复：仅补中文标点，不改字、不增删内容、不动时间戳。
+
+    仅在 transcript.language=='zh' 且文本基本无标点时调用；失败（无网络/异常）
+    一律回退为原文本，绝不影响主流程。
+    """
+
+    if not text or not _needs_punctuation(text):
+        return text
+    sys_p = (
+        "你是一个严谨的中文标点校对助手。下面是一段带 [MM:SS] 时间戳的中文语音识别原文。"
+        "请【仅】补上缺失的中文标点（逗号、句号、问号、感叹号、顿号等），让句子可以正常断句；"
+        "【绝对不要】改动、增删任何汉字或时间戳，【不要】输出任何解释或多余文字。"
+        "直接返回补好标点的原文。"
+    )
+    user = text
+    try:
+        from .ratelimit import RateLimiter
+
+        rl = RateLimiter(tier=ai.tier, provider=ai.provider, model=ai.model)
+        rl.wait_before_call()
+        raw = client.chat.completions.with_raw_response.create(
+            model=ai.model,
+            messages=[
+                {"role": "system", "content": sys_p},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.0,
+            max_tokens=max(len(text) * 2, 2048),
+        )
+        return _raw_content(raw).strip() or text
+    except Exception:  # noqa: BLE001
+        return text
+
+
 def _call_llm(client, ai: AIConfig, system_prompt: str, user_msg: str,
              max_tokens: int, proxy: str = "", rate_limiter: RateLimiter = None,
              retries: int = 3) -> dict:
@@ -208,7 +292,8 @@ def _call_llm(client, ai: AIConfig, system_prompt: str, user_msg: str,
 
     for attempt in range(retries):
         try:
-            resp = client.chat.completions.create(
+            # 用 with_raw_response 拿到原生响应头，让限流头（x-ratelimit-*）真正生效
+            raw = client.chat.completions.with_raw_response.create(
                 model=ai.model,
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -218,9 +303,12 @@ def _call_llm(client, ai: AIConfig, system_prompt: str, user_msg: str,
                 temperature=0.3,
                 max_tokens=max_tokens,
             )
-            content = resp.choices[0].message.content or ""
             if rate_limiter is not None:
-                rate_limiter.update_from_response(resp)
+                try:
+                    rate_limiter.update_from_response(raw.headers)
+                except Exception:  # noqa: BLE001
+                    pass
+            content = _raw_content(raw)
             return _parse_json(content)
         except Exception as e:
             err_str = str(e)
@@ -293,7 +381,7 @@ def _build_full_text(segments: List[Segment], interval_sec: int = 180, max_chars
         if not text:
             continue
         if s.start - last_ts >= interval_sec:
-            buf.append(f"\n[{format_timestamp(s.start)}] ")
+            buf.append(f"\n\n[{format_timestamp(s.start)}] ")
             last_ts = s.start
         buf.append(text)
         chars += len(text) + 1
@@ -311,7 +399,9 @@ def _generate_overview(transcript, client, ai: AIConfig, proxy: str, rate_limite
 
     head = _build_chunk_text(transcript.segments)[:1500]
     sys_p = (
-        "你是视频内容分析助手。请用一句简体中文（20-40字）概述整个视频在讲什么，"
+        "你是视频内容分析助手。"
+        + _language_instruction(transcript.language)
+        + "请用一句话（20-40字）概述整个视频在讲什么，"
         "关键术语用 **加粗** 包裹。只输出这句话本身，不要 JSON、不要任何解释或引号。"
     )
     user = (
@@ -322,7 +412,7 @@ def _generate_overview(transcript, client, ai: AIConfig, proxy: str, rate_limite
     )
     try:
         rate_limiter.wait_before_call()
-        resp = client.chat.completions.create(
+        raw = client.chat.completions.with_raw_response.create(
             model=ai.model,
             messages=[
                 {"role": "system", "content": sys_p},
@@ -331,7 +421,7 @@ def _generate_overview(transcript, client, ai: AIConfig, proxy: str, rate_limite
             temperature=0.3,
             max_tokens=120,
         )
-        ov = (resp.choices[0].message.content or "").strip().strip('"').strip()
+        ov = (_raw_content(raw)).strip().strip('"').strip()
         return ov
     except Exception:  # noqa: BLE001
         # 回退：用开头首句
@@ -371,13 +461,30 @@ def generate_summary(
         )
 
     client = _client_for(ai, proxy)
+
+    # tier 自动探测（由 product-reviewer 提供的 core.tier_probe.detect_tier 完成）；
+    # 模块尚不存在时安全跳过，沿用用户自报的 ai.tier。
+    try:
+        from core.tier_probe import detect_tier
+
+        detected = detect_tier(ai, proxy)
+        if detected:
+            ai.tier = detected
+    except Exception:  # noqa: BLE001
+        pass
+
     rate_limiter = RateLimiter(tier=ai.tier, provider=ai.provider, model=ai.model)
     if ai.tier == "free":
         rate_limiter.notify_if_free()
 
+    # 输出语言跟随视频语种
+    lang_inst = _language_instruction(transcript.language)
+
     # 全文文案模式：不调 AI 分章，直接输出带时间戳的连续转录文案（内容概述仍用一次轻量调用生成）
     if mode == "fulltext":
         full_text = _build_full_text(transcript.segments)
+        # 中文视频且转录基本无标点时，做一次轻量标点恢复（失败回退原文本）
+        full_text = _restore_punctuation(full_text, client, ai, proxy)
         try:
             overview = _generate_overview(transcript, client, ai, proxy, rate_limiter)
         except Exception:  # noqa: BLE001
@@ -396,8 +503,12 @@ def generate_summary(
         )
 
     mode_inst, query_inst = _build_mode_instructions(mode, query)
-    chunk_system = _CHUNK_SYSTEM_PROMPT.format(mode_instruction=mode_inst, query_instruction=query_inst)
-    merge_system = _MERGE_SYSTEM_PROMPT.format(mode_instruction=mode_inst, query_instruction=query_inst)
+    chunk_system = _CHUNK_SYSTEM_PROMPT.format(
+        language_instruction=lang_inst, mode_instruction=mode_inst, query_instruction=query_inst
+    )
+    merge_system = _MERGE_SYSTEM_PROMPT.format(
+        language_instruction=lang_inst, mode_instruction=mode_inst, query_instruction=query_inst
+    )
 
     chunks = _chunk_segments(transcript.segments, _CHUNK_MAX_CHARS)
     total = len(chunks)

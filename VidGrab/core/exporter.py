@@ -19,7 +19,7 @@ import re
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from datetime import date
+from datetime import date, datetime
 
 from . import Summary, Transcript
 from .config import OutputConfig
@@ -72,6 +72,25 @@ def _safe_title(transcript: Transcript, mode_label: str = "") -> str:
     return name
 
 
+def _unique_path(save_dir: Path, base_name: str, ext: str) -> Path:
+    """生成不覆盖已有文件的落盘路径。
+
+    规则：目标不存在直接返回；已存在依次尝试 {base}_2.{ext} … {base}_99.{ext}，
+    仍冲突（极端情况）退化为 {base}_{HHMMSS}.{ext}（时间戳兜底）。
+    这样同一视频同模式当天重跑不会静默覆盖旧文件，同时保留标题可读性；
+    目录已按 YYYYMMDD 分组，同一天重复跑加 _(n) 即可区分。
+    """
+    candidate = save_dir / f"{base_name}.{ext}"
+    if not candidate.exists():
+        return candidate
+    for n in range(2, 100):
+        candidate = save_dir / f"{base_name}_{n}.{ext}"
+        if not candidate.exists():
+            return candidate
+    ts = datetime.now().strftime("%H%M%S")
+    return save_dir / f"{base_name}_{ts}.{ext}"
+
+
 def _resolve_save_dir(output: OutputConfig) -> Path:
     """决定落盘目录：默认项目 output/YYYYMMDD/；配置 save_path 时则 save_path/YYYYMMDD/。
 
@@ -95,7 +114,7 @@ def export_markdown(summary: Summary, output: OutputConfig, transcript: Transcri
     text = render_summary_md(summary)
     save_dir = _resolve_save_dir(output)
     save_dir.mkdir(parents=True, exist_ok=True)
-    path = save_dir / f"{_safe_title(transcript, mode_label)}.md"
+    path = _unique_path(save_dir, _safe_title(transcript, mode_label), "md")
     path.write_text(text, encoding="utf-8")
     return path
 
@@ -141,7 +160,7 @@ def export_html(summary: Summary, output: OutputConfig, transcript: Transcript, 
     html = _build_html(summary)
     save_dir = _resolve_save_dir(output)
     save_dir.mkdir(parents=True, exist_ok=True)
-    path = save_dir / f"{_safe_title(transcript, mode_label)}.html"
+    path = _unique_path(save_dir, _safe_title(transcript, mode_label), "html")
     path.write_text(html, encoding="utf-8")
     return path
 
@@ -164,7 +183,7 @@ def export_pdf(summary: Summary, output: OutputConfig, transcript: Transcript, m
 
     save_dir = _resolve_save_dir(output)
     save_dir.mkdir(parents=True, exist_ok=True)
-    path = save_dir / f"{_safe_title(transcript, mode_label)}.pdf"
+    path = _unique_path(save_dir, _safe_title(transcript, mode_label), "pdf")
 
     try:
         pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
@@ -458,7 +477,7 @@ def export_docx(summary: Summary, output: OutputConfig, transcript: Transcript, 
 
     save_dir = _resolve_save_dir(output)
     save_dir.mkdir(parents=True, exist_ok=True)
-    path = save_dir / f"{_safe_title(transcript, mode_label)}.docx"
+    path = _unique_path(save_dir, _safe_title(transcript, mode_label), "docx")
     doc.save(str(path))
     return path
 
@@ -834,7 +853,7 @@ def export_image(summary: Summary, output: OutputConfig, transcript: Transcript,
 
     save_dir = _resolve_save_dir(output)
     save_dir.mkdir(parents=True, exist_ok=True)
-    path = save_dir / f"{_safe_title(transcript, mode_label)}.png"
+    path = _unique_path(save_dir, _safe_title(transcript, mode_label), "png")
     img.save(str(path), "PNG")
     return path
 

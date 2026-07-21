@@ -26,4 +26,7 @@ PyYAML>=6.0
 #                    #        默认 PDF 引擎已用 xhtml2pdf，无需此项。装好则 exporter 自动优先用它）
 # litellm>=1.0.0     # 多模型路由（待接入）
 # mcp>=1.0.0         # MCP Server（待接入）
+# psutil>=5.9.0      # 可选：本地转录前的系统内存/页面文件预检（P0 防护）。
+#                    #        代码内已 try/except 容错——未安装则跳过预检、不阻塞转录，
+#                    #        因此【不要放进首次安装】，用户按需 pip install psutil 即可获得增强防护。
 

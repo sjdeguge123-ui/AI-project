@@ -52,6 +52,7 @@ class WhisperConfig:
     local_model: str = "base"  # local 模式模型大小
     device: str = "auto"       # auto（自动检测GPU，优先GPU）| cpu | cuda
     compute_type: str = "auto" # auto（GPU默认int8_float16/CPU默认int8）| float16 | int8 | int8_float16
+    language: str = "auto"     # auto（跟随视频/自动检测）| zh | en；透传给 ASR 以锁定语种与标点
 
 
 @dataclass

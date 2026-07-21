@@ -7,10 +7,13 @@
   · 所有意外（限流 / 服务器繁忙）都要把「发生了什么 + 怎么解决」告诉用户。
 
 设计：
-  tier 来源：用户在 setup_ai 里自报 free / paid（默认 free=保守安全）。
-            Key 本身看不出免费/付费，所以必须让用户自己确认。
+  tier 来源：优先由 core/tier_probe.detect_tier 按 provider 自动探测
+            （OpenAI/DeepSeek 直查、SiliconFlow 模型启发式、Ollama 恒付费），并把结果
+            写回 config.yaml；探测失败则回退用户在 setup_ai 里自报的 free / paid
+            （默认 free=保守安全）。因此用户无需手改 config，充值后重跑即自动升级。
   + 已知免费模型库（如硅基流动 deepseek-ai/DeepSeek-V3 免费档）做提示与默认间隔。
-  + 每次调用后读取响应头 x-ratelimit-*，动态细化真实 RPM 间隔。
+  + 每次调用后读取响应头 x-ratelimit-*，动态细化真实 RPM 间隔（需 summarizer 改用
+    with_raw_response 才能拿到真实头；见 gstack-investigator 的修复）。
 
 关于「付费可随意调用直到达上限」的论证（写进代码注释，便于团队理解）：
   付费档 RPM 通常数十~数百次/分钟（DeepSeek 付费约 60 RPM 起、可提额；
@@ -85,8 +88,21 @@ class RateLimiter:
         print(f"   为保证流程跑完不被限流，每次 AI 调用之间会间隔约 {int(self.min_interval)} 秒。")
         if _is_known_free_model(self.provider, self.model):
             print(f"   （{self.provider}/{self.model} 属于已知免费模型，限频更明显）")
-        print("   💡 若你其实是【付费】额度：把 config.yaml 的 ai.tier 改成 paid 即可提速；")
-        print("      或把硅基流动 / DeepSeek 账户升级为付费，RPM 会大幅提升。")
+        print("   💡 若你其实是【付费】额度：工具会自动检测并解除限速（无需手改 config）。")
+        print("      若已充值但仍被限速，重跑本工具即可自动升级。")
+
+    # ---- 付费误判时的安全网 ----------------------------------------------
+    def downgrade_if_limited(self) -> None:
+        """安全网：被判定为付费档（探测结果）却仍收到 429 限流时，临时降级为免费档限速。
+
+        目的：避免「探测误判为付费」导致单次任务被服务端限流卡死。降级只影响本次运行的
+        调用间隔，不写回 config（下次运行仍按探测结果重新判定）。
+        """
+        if self.tier != "paid":
+            return
+        self.tier = "free"
+        self.min_interval = self._compute_interval()
+        print("   ⚠️ 探测为付费额度但仍触发限流，已临时切换为免费档限速以保证流程跑完。")
 
     # ---- 调用前等待 --------------------------------------------------------
     def wait_before_call(self) -> None:

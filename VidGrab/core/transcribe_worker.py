@@ -50,6 +50,10 @@ def _parse_args():
     p.add_argument("--device", default="auto")
     p.add_argument("--compute-type", default="auto")
     p.add_argument("--chunk-sec", type=int, default=120)
+    p.add_argument("--resume", type=float, default=0.0,
+                   help="断点续传起点（秒）。>0 时跳过已转录的块，从进度文件合并已有 segments。")
+    p.add_argument("--language", default="auto",
+                   help="语种锁定（auto=自动检测）。透传给 faster-whisper。")
     p.add_argument("--output-json", required=True)
     return p.parse_args()
 
@@ -67,21 +71,28 @@ def main() -> int:
             device=args.device,
             compute_type=args.compute_type,
             chunk_sec=args.chunk_sec,
+            resume_sec=args.resume or 0.0,
+            language=args.language or None,
         )
         data = [
             {"start": float(s.start), "end": float(s.end), "text": s.text}
             for s in segments
         ]
+        # 成功路径严格顺序：写 JSON（关闭落盘）→ flush → os._exit(0)，避免把成功当失败
         with open(args.output_json, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False)
-        sys.stderr.write(f"_WORKER_DONE segments={len(segments)}\n")
+            f.flush()
+            os.fsync(f.fileno())
+        print(f"_WORKER_DONE segments={len(segments)}")
         sys.stdout.flush()
         sys.stderr.flush()
         # 关键：直接退出，绕过 WhisperModel/CTranslate2 析构（Windows 下偶发硬崩/挂起）。
         # 子进程死亡后 OS 回收全部内存与 CUDA 上下文，主流程不受影响。
+        # 注意：进度文件（<audio>.progress.json）由父进程在最终成功后删除，此处不删，
+        # 以便子进程崩溃时父进程能从断点续传。
         os._exit(0)
     except Exception:  # noqa: BLE001
-        # 把 traceback 打到 stderr，父进程会捕获并提示用户
+        # 把 traceback 打到 stderr，父进程会捕获并分类（OOM vs 真崩溃）
         sys.stderr.write(traceback.format_exc())
         sys.stderr.flush()
         os._exit(1)

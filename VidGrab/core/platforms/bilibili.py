@@ -144,6 +144,7 @@ def extract_bilibili(
             audio_path=str(audio_path),
             page_index=page_index,
             is_collection=is_collection,
+            language="zh",
         )
 
     # 1) 优先用 bilibili_api 取真字幕（需要登录 cookie）
@@ -180,6 +181,7 @@ def extract_bilibili(
             source="subtitle",
             page_index=page_index,
             is_collection=is_collection,
+            language="zh",
         )
 
     if download_audio:
@@ -198,6 +200,7 @@ def extract_bilibili(
             audio_path=str(audio_path),
             page_index=page_index,
             is_collection=is_collection,
+            language="zh",
         )
 
     # 3) 两种都取不到真字幕：给出「登录引导」而不是干巴巴的报错

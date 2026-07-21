@@ -27,6 +27,11 @@ from typing import List, Optional
 from . import Segment, Transcript
 from .config import WhisperConfig
 
+try:
+    import psutil  # 可选依赖：缺失时跳过内存预检，不阻塞转录
+except ImportError:
+    psutil = None
+
 
 def _fmt_ts(sec) -> str:
     """把秒数格式化成「X分Y秒」，用于转录进度展示。"""
@@ -35,6 +40,50 @@ def _fmt_ts(sec) -> str:
         return f"{sec // 60}分{sec % 60}秒"
     except Exception:  # noqa: BLE001
         return str(sec)
+
+
+def _preflight_memory(threshold_gb: float = 2.5) -> None:
+    """转录前的系统内存/页面文件预检（P0 最高杠杆）。
+
+    转录（尤其本地 faster-whisper）加载 torch/CTranslate2 时要向系统提交数百 MB 连续
+    虚拟内存。Windows 下若页面文件太小、或物理内存+页面文件余量不足，会在模型加载期
+    直接抛 WinError 1455 / mkl_malloc / ArrayMemoryError，表现为「时好时坏、刚跑通又崩」。
+
+    本函数：尽量用 psutil 估算「可用物理内存 + 页面文件余量」，低于阈值则提前打印清晰
+    告警与处置建议（切换 whisper.mode: api 云端、或换更小模型、或增大页面文件）。
+    注意：仅为「告警增强」——不阻断转录（仍继续尝试），把最终失败/回退交给 OOM 分类逻辑。
+
+    psutil 未安装时直接跳过（不阻塞）：把可用内存预检作为「有则增强」的防护，而非硬依赖。
+    """
+    if psutil is None:
+        return  # psutil 缺失：跳过预检，不阻塞转录
+
+    try:
+        vm = psutil.virtual_memory()
+        avail = getattr(vm, "available", 0) or 0
+        # 页面文件余量近似：Windows 上 swap_memory().free 即页面文件可用空间
+        swap_free = 0
+        try:
+            swap = psutil.swap_memory()
+            swap_free = getattr(swap, "free", 0) or 0
+        except Exception:  # noqa: BLE001
+            swap_free = 0
+        total_avail = avail + swap_free
+        gb = total_avail / (1024 ** 3)
+    except Exception:  # noqa: BLE001
+        return  # 取不到内存信息：跳过预检
+
+    if gb < threshold_gb:
+        print(
+            f"   ⚠️ 系统可用内存/页面文件偏低（约 {gb:.1f} GB，阈值 {threshold_gb:.1f} GB），"
+            "本地转录可能不稳定（易触发 WinError 1455 / mkl_malloc / ArrayMemoryError）。\n"
+            "   建议：① 改用云端模式（config.yaml 设 whisper.mode: api）；"
+            "② 使用更小的本地模型（如 tiny/base）；"
+            "③ 增大 Windows 虚拟内存（页面文件）到物理内存的 1.5–2 倍；"
+            "④ 关闭其他重型程序后重试。\n"
+            "   （预检仅为告警，转录仍将继续尝试；若失败将自动触发 GPU→CPU→api 回退。）"
+        )
+        # 仅告警，不阻断：仍继续尝试转录
 
 
 def transcribe(transcript: Transcript, config: Optional[WhisperConfig] = None) -> Transcript:
@@ -54,13 +103,14 @@ def transcribe(transcript: Transcript, config: Optional[WhisperConfig] = None) -
         raise FileNotFoundError(f"音频文件不存在：{audio_path}")
 
     if config.mode == "api":
-        segments = _transcribe_api(audio_path, config.api_key)
+        segments = _transcribe_api(audio_path, config.api_key, language=getattr(config, "language", None))
     elif config.mode == "local":
         segments = _transcribe_local(
             audio_path,
             config.local_model,
             device=getattr(config, "device", "auto"),
             compute_type=getattr(config, "compute_type", "auto"),
+            language=getattr(config, "language", None),
         )
     else:
         raise ValueError(
@@ -80,8 +130,8 @@ def transcribe(transcript: Transcript, config: Optional[WhisperConfig] = None) -
     )
 
 
-def _transcribe_api(audio_path: Path, api_key: str) -> List[Segment]:
-    """云端 Whisper API（OpenAI）。需 api_key。"""
+def _transcribe_api(audio_path: Path, api_key: str, language: Optional[str] = None) -> List[Segment]:
+    """云端 Whisper API（OpenAI）。需 api_key。language=None 时由云端自动检测。"""
 
     if not api_key:
         raise ValueError(
@@ -97,6 +147,7 @@ def _transcribe_api(audio_path: Path, api_key: str) -> List[Segment]:
             file=f,
             response_format="verbose_json",
             timestamp_granularities=["segment"],
+            language=language,
         )
 
     segments: List[Segment] = []
@@ -142,12 +193,16 @@ def _run_local_transcription(
     device: str = "auto",
     compute_type: str = "auto",
     chunk_sec: int = 120,
+    resume_sec: float = 0.0,
+    language: Optional[str] = None,
 ) -> List[Segment]:
     """本地 faster-whisper 推理（实际执行体，运行在隔离子进程内）。
 
     device: auto（自动检测）| cpu | cuda
     compute_type: auto（GPU 默认 int8_float16，CPU 默认 int8）| float16 | int8 | int8_float16
-    chunk_sec: 每块转录秒数。GPU 用 2 分钟求速度；CPU 用 30 秒避免 MKL 大段分配失败。
+    chunk_sec: 每块转录秒数。GPU/CPU 统一用 120 秒——固定块长保证断点续传时分块边界一致。
+    resume_sec: 断点续传起点（秒）。>0 时跳过已转录的块，并从进度文件合并已有 segments。
+    language: 语种锁定（None=自动检测），透传给 faster-whisper / Whisper API。
 
     注意：此函数被 core/transcribe_worker.py 在独立子进程中调用，目的是把 GPU/CUDA
     状态完全隔离，避免 Windows 下 CTranslate2 模型析构时硬崩溃拖垮主流程。
@@ -218,18 +273,46 @@ def _run_local_transcription(
     # 预先把音频转成 16kHz mono WAV，避免 faster-whisper 内部读取/重采样时触发端崩溃
     wav_path = _ensure_wav_16k_mono(audio_path)
 
+    # 断点续传：进度文件与音频同名（key 为原始 audio_path，父进程与子进程用同一公式推导，
+    # 不受「音频是否已为 16k wav」影响），保证边界一致、不会串音。
+    progress_path = Path(str(audio_path) + ".progress.json")
+    existing_segments: List[dict] = []
+    if resume_sec and resume_sec > 0 and progress_path.exists():
+        try:
+            with open(progress_path, "r", encoding="utf-8") as f:
+                prog = json.load(f)
+            existing_segments = list(prog.get("segments", []) or [])
+            print(f"   🔄 检测到断点进度（已完成 {resume_sec:.0f}s，已有 {len(existing_segments)} 段），将从断点续传...")
+        except Exception:  # noqa: BLE001
+            existing_segments = []
+
     # 关键：分块转录。直接把整段文件路径丢给 model.transcribe() 会让 faster-whisper
     # 一次性解码 + 全量 STFT（feature_extractor 对整段音频建帧数组 + rfft 复数数组），
     # 长视频（30min+）峰值需要数 GB 连续主机内存、且要求一次性分配，空闲内存波动时
     # 会间歇性抛 numpy ArrayMemoryError（表现为「时好时坏、转录后自己结束」）。
     # 改为：先解码成 16kHz mono numpy（33min 约 128MB），再按 CHUNK_SEC 秒切片逐块转录，
     # 每块特征数组只有几分钟大小（峰值降两个数量级），并按块起点偏移拼接时间戳。
+    # 每块成功后原子写 progress.json，崩溃可续传，避免反复从头重跑吃满页面文件。
     print("   🎙️ 开始转录，请稍候（长音频自动分块，期间会显示进度）...")
-    segments = _transcribe_chunked(model, wav_path, chunk_sec=chunk_sec)
+    segments = _transcribe_chunked(
+        model,
+        wav_path,
+        chunk_sec=chunk_sec,
+        resume_sec=resume_sec,
+        progress_path=progress_path,
+        existing_segments=existing_segments,
+        language=language,
+    )
     return segments
 
 
-def _transcribe_local(audio_path: Path, model_size: str, device: str = "auto", compute_type: str = "auto") -> List[Segment]:
+def _transcribe_local(
+    audio_path: Path,
+    model_size: str,
+    device: str = "auto",
+    compute_type: str = "auto",
+    language: Optional[str] = None,
+) -> List[Segment]:
     """本地 faster-whisper 转录（子进程隔离版）。
 
     把 GPU/CUDA 重活放进独立子进程（core/transcribe_worker.py），子进程退出时 CUDA 状态
@@ -239,19 +322,27 @@ def _transcribe_local(audio_path: Path, model_size: str, device: str = "auto", c
     回退策略：
       第 1 次：按 config 的 device（auto 则优先 GPU）
       第 2 次：若 GPU 崩，强制 CPU + int8
-      第 3 次：若 CPU 也崩，CPU 单线程 + 30 秒小块（进一步降低 MKL 内存压力）
-      仍失败：提示用户改 whisper.mode: api
+      第 3 次：CPU 仍崩（非内存类）→ 再次 CPU 重试；但若是内存/页面文件类（OOM）失败，
+              连续 2 次即提前终止，避免反复全量重启把页面文件吃满（见 OOM 早停）。
+
+    断点续传：每次启动子进程前检测进度文件，存在则把已完成秒数通过 --resume 传给 worker，
+    从断点续跑而非从头重来。GPU→CPU 回退时固定 chunk_sec=120，保证分块边界一致。
     """
 
     audio_path = Path(audio_path)
     json_path = audio_path.with_suffix(".segments.json")
+    progress_path = Path(str(audio_path) + ".progress.json")
     project_root = Path(__file__).parent.parent
+
+    # P0 内存预检：可用内存/页面文件不足时提前给清晰建议，避免硬闯后被 OOM 打挂再反复重启
+    _preflight_memory()
 
     max_runs = 3
     last_err: Optional[Exception] = None
+    oom_streak = 0  # 连续 OOM 类失败计数，达到 2 即早停
     use_device = device
     use_compute_type = compute_type
-    use_chunk_sec = 120  # GPU 或常规 CPU 用 2 分钟块
+    use_chunk_sec = 120  # GPU/CPU 统一 120 秒固定块长（续传边界一致；小块不缓解 MKL 加载期分配）
     for run_i in range(1, max_runs + 1):
         if run_i > 1:
             print(f"   🔁 重试本地转录子进程（第 {run_i}/{max_runs} 次）...")
@@ -261,12 +352,15 @@ def _transcribe_local(audio_path: Path, model_size: str, device: str = "auto", c
                 use_device = "cpu"
                 use_compute_type = "int8"
                 use_chunk_sec = 120
-            # 若 CPU 也崩，进一步降到单线程 + 30 秒小块，避开 MKL 大段分配
-            if run_i == 3:
-                print("   🐢 CPU 路径仍异常，进一步限制单线程 + 30 秒小块重试...")
-                use_device = "cpu"
-                use_compute_type = "int8"
-                use_chunk_sec = 30
+
+        # 断点续传：读进度文件取已完成秒数（崩溃残留则续跑，成功则已被本函数删除）
+        resume_sec = 0.0
+        if progress_path.exists():
+            try:
+                with open(progress_path, "r", encoding="utf-8") as f:
+                    resume_sec = float(json.load(f).get("completed_until_sec", 0) or 0)
+            except Exception:  # noqa: BLE001
+                resume_sec = 0.0
 
         # 子进程环境变量：
         #  - CT2_CUDA_ALLOCATOR=cuda_malloc_async：根治 Windows 下 CUDA 默认分配器的
@@ -292,6 +386,8 @@ def _transcribe_local(audio_path: Path, model_size: str, device: str = "auto", c
             "--compute-type", str(use_compute_type),
             "--chunk-sec", str(use_chunk_sec),
             "--output-json", str(json_path),
+            "--resume", str(resume_sec),
+            "--language", str(language) if language else "",
         ]
         print("   🔧 启动本地转录子进程（隔离 GPU 状态，避免崩溃拖垮主流程）...")
         proc = subprocess.Popen(
@@ -305,10 +401,13 @@ def _transcribe_local(audio_path: Path, model_size: str, device: str = "auto", c
             cwd=str(project_root),
             env=env,
         )
-        # 实时转发子进程进度输出（含分块进度），保持用户可见
+        # 实时转发子进程进度输出（含分块进度），并缓冲用于失败根因分类
         assert proc.stdout is not None
+        child_log: list[str] = []
         for line in proc.stdout:
-            print(line.rstrip("\n"))
+            s = line.rstrip("\n")
+            print(s)
+            child_log.append(s)
         rc = proc.wait()
 
         if rc == 0 and json_path.exists():
@@ -324,34 +423,83 @@ def _transcribe_local(audio_path: Path, model_size: str, device: str = "auto", c
                     json_path.unlink()
                 except Exception:  # noqa: BLE001
                     pass
+                # 成功：删除断点进度文件（避免下次误续传旧音频残留）
+                try:
+                    progress_path.unlink()
+                except Exception:  # noqa: BLE001
+                    pass
             return segments
 
-        # 失败：记录错误，准备重试
+        # 失败：识别 OOM 类信号（页面文件/显存/内存分配），连续 2 次则早停，避免反复重启吃满页面文件
+        child_text = "\n".join(child_log)
+        is_oom = _is_oom_failure(child_text)
+        if is_oom:
+            oom_streak += 1
+        else:
+            oom_streak = 0
         last_err = RuntimeError(
             f"本地转录子进程异常退出（exit code={rc}）。\n"
             "常见原因：① 模型加载/GPU 崩溃（瞬时内存分配失败）② 音频文件损坏 ③ 依赖缺失。\n"
             "建议：在 config.yaml 设置 whisper.device: cpu 或 whisper.compute_type: int8，"
             "或改用 whisper.mode: api 云端转录。"
         )
-        # 清理可能残留的 json
+        # 清理可能残留的 json（进度文件保留用于续传）
         try:
             json_path.unlink()
         except Exception:  # noqa: BLE001
             pass
+
+        if oom_streak >= 2:
+            raise RuntimeError(
+                "转录因系统内存/页面文件不足反复失败（已连续 2 次报内存分配类错误），"
+                "不再盲目重试以免把虚拟内存吃满。\n"
+                "建议：① 增大 Windows 虚拟内存（页面文件）到物理内存的 1.5–2 倍；"
+                "② 改用云端模式（config.yaml 设 whisper.mode: api）；"
+                "③ 关闭其他重型程序后重试。"
+                "（若仍想本地尝试，可在 config.yaml 把 whisper.device 设为 cpu 并换更小模型。）"
+            )
         _time.sleep(2)
 
-    # 全部重试失败
+    # 全部重试失败（非 OOM 类真崩溃，已尽回退）
     raise last_err
+
+
+# OOM / 内存-页面文件类失败信号：命中任一即视为「系统资源不足」，用于早停
+_OOM_SIGNALS = (
+    "WinError 1455",
+    "页面文件太小",
+    "mkl_malloc",
+    "ArrayMemoryError",       # 规范指定：numpy 内存分配失败
+    "_ArrayMemoryError",       # numpy 异常类全名中的子串
+    "cuBLAS_NOT_SUPPORTED",    # 规范指定：cuBLAS 不支持（显存/算力不足）
+    "cuBLAS_STATUS_NOT_SUPPORTED",
+    "STATUS_STACK_BUFFER_OVERRUN",
+    "3221226505",             # Windows 下内存/栈相关的进程退出码
+)
+
+
+def _is_oom_failure(text: str) -> bool:
+    """判断子进程失败输出是否属于内存/页面文件不足类（OOM）。"""
+    return any(sig in text for sig in _OOM_SIGNALS)
 
 
 # 单块采样率（固定 16kHz mono）
 _SAMPLE_RATE = 16000
 
-# 不再用固定 _CHUNK_SEC：GPU 默认 2 分钟求速度；CPU 回退时由 _transcribe_local 传入 30 秒小块。
+# 固定块长：GPU/CPU 统一 120 秒。固定块长保证断点续传时分块边界一致（resume 不串音），
+# 且「小块缓解 MKL 加载期分配」是误区——MKL 加载在分块之前就完成，小块只会增开销。
 
 
-def _transcribe_chunked(model, wav_path: Path, chunk_sec: int = 120) -> List[Segment]:
-    """按固定时长用标准库 wave 分块读取 PCM 并逐块转录，拼接时间戳。
+def _transcribe_chunked(
+    model,
+    wav_path: Path,
+    chunk_sec: int = 120,
+    resume_sec: float = 0.0,
+    progress_path: Optional[Path] = None,
+    existing_segments: Optional[List[dict]] = None,
+    language: Optional[str] = None,
+) -> List[Segment]:
+    """按固定时长用标准库 wave 分块读取 PCM 并逐块转录，拼接时间戳（支持断点续传）。
 
     为什么必须按块「流式」读取，而不是 decode_audio 整段解码：
     faster-whisper 的 feature_extractor 会对「喂进来的整段音频」一次性做 STFT；而
@@ -361,11 +509,23 @@ def _transcribe_chunked(model, wav_path: Path, chunk_sec: int = 120) -> List[Seg
 
     改为：直接用标准库 wave 按块读取 16k mono PCM（每块仅约几 MB），转 float32 后
     逐块喂给 model.transcribe()，每次只处理一小块，峰值内存恒定在几十 MB，无论视频多长都稳定。
+
+    断点续传：resume_sec>0 时跳过 offset<resume_sec 的已完成块（resume_sec 必为整块边界）；
+    已有 segments 先并入结果，新块完成后原子写 progress.json（写临时文件再 os.replace），
+    子进程崩溃后该文件仍留存，父进程下次重试用 --resume 从断点续跑，避免反复从头重跑。
     """
 
     import gc
     import numpy as np
     import wave
+
+    existing_segments = existing_segments or []
+    # 合并已有 segments：existing 来自进度文件，offset 已是全局时间戳，直接并入
+    segments: List[Segment] = [
+        Segment(start=float(d["start"]), end=float(d["end"]), text=str(d["text"]))
+        for d in existing_segments
+    ]
+    _done_existing = len(segments)
 
     with wave.open(str(wav_path), "rb") as wf:
         fr = wf.getframerate()
@@ -382,13 +542,15 @@ def _transcribe_chunked(model, wav_path: Path, chunk_sec: int = 120) -> List[Seg
         total_dur = nframes / fr
         n_chunks = max(1, (nframes + chunk_frames - 1) // chunk_frames)
 
-        segments: List[Segment] = []
         _last_log = _time.time()
         _count = 0
         for ci in range(n_chunks):
             s0 = ci * chunk_frames
             s1 = min(nframes, s0 + chunk_frames)
             offset = s0 / fr  # 该块在整段音频中的起始秒数，用于还原全局时间戳
+            # 断点续传：跳过已完成块（resume_sec 必等于某块结束边界）
+            if resume_sec and offset < resume_sec - 1e-6:
+                continue
             raw = wf.readframes(s1 - s0)
             if not raw:
                 break
@@ -400,6 +562,7 @@ def _transcribe_chunked(model, wav_path: Path, chunk_sec: int = 120) -> List[Seg
                     beam_size=5,
                     word_timestamps=False,
                     condition_on_previous_text=False,  # 避免缓存/复用前一段文本，降低内存与错位风险
+                    language=language,
                 )
             except Exception as exc:  # noqa: BLE001
                 raise RuntimeError(
@@ -428,10 +591,46 @@ def _transcribe_chunked(model, wav_path: Path, chunk_sec: int = 120) -> List[Seg
             done_dur = s1 / fr
             _dpct = int(done_dur / total_dur * 100) if total_dur else 100
             print(f"   ✅ 已完成第 {ci + 1}/{n_chunks} 块（累计 {_fmt_ts(done_dur)} / {_fmt_ts(total_dur)}，{_dpct}%）")
+
+            # 断点续传：每完成一块即原子写进度（含已合并的累计 segments + 本块结束边界）。
+            # 写临时文件再 os.replace，保证幂等、崩溃时仍留上一块的有效进度。
+            if progress_path is not None:
+                _write_progress_atomic(progress_path, done_dur, segments)
+
             # 主动 GC，降低长音频多段情况下的内存碎片
             gc.collect()
 
     return segments
+
+
+def _write_progress_atomic(progress_path: Path, completed_until_sec: float, segments: List[Segment]) -> None:
+    """原子写断点续传进度文件（写临时文件 -> os.replace），避免半截写损坏。"""
+    import tempfile
+
+    data = {
+        "completed_until_sec": float(completed_until_sec),
+        "segments": [
+            {"start": float(s.start), "end": float(s.end), "text": str(s.text)}
+            for s in segments
+        ],
+    }
+    try:
+        tmp_fd, tmp_name = tempfile.mkstemp(dir=str(progress_path.parent), suffix=".tmp")
+        try:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_name, str(progress_path))
+        finally:
+            if os.path.exists(tmp_name):
+                try:
+                    os.unlink(tmp_name)
+                except Exception:  # noqa: BLE001
+                    pass
+    except Exception:  # noqa: BLE001
+        # 进度写失败不应影响转录本身（下一块重试时还会再写）
+        pass
 
 
 def _ensure_wav_16k_mono(audio_path: Path) -> Path:
