@@ -87,12 +87,19 @@ def _map_bili_lang(lan: str, text: str = "") -> str:
     lan = (lan or "").lower().strip()
     if not lan:
         return ""
+    # B站 AI 机翻字幕形如 "ai-ja" / "ai-es" / "ai-ar"，先剥前缀再归一
+    if lan.startswith("ai-"):
+        lan = lan[3:]
     base = lan.split("-")[0]
-    if base in ("ja", "jp", "ko", "en"):
+    # 已识别语种集合（含 ja/jp/ko/en 及 es/ar/fr/de/ru/pt/it 等 AI 字幕常见语种）
+    KNOWN = ("ja", "jp", "ko", "en", "es", "ar", "fr", "de", "ru", "pt", "it")
+    # 仅 CJK 语种会被 B站 常错标（如中文被标成 ja/ko/en），且文本检测对 CJK 可靠；
+    # 非 CJK（es/ar/fr/de 等）检测器无法可靠区分，且 B站 标注通常准确，应直接信任元数据。
+    CJK_LANGS = ("zh", "ja", "jp", "ko")
+    if base in KNOWN:
         if text:
-            # 交叉校验：用文本真实语种纠正 B站 常错的 lan 元数据
             detected = _detect_language_of(text)
-            if detected in ("zh", "ja", "ko", "en"):
+            if detected in CJK_LANGS:
                 return detected
         return base
     # zh / cn / ai-zh 等：退回文本判定，避免元数据误标

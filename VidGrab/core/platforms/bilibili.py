@@ -309,6 +309,15 @@ def _choose_subtitle(subtitles: list, prefer_chinese: bool):
     ]
     if originals:
         return originals[0], False
+    # 该视频只有 AI 机翻字幕：除 ai-zh（中文翻译）外，ai-ja/ai-es/ai-ar 等也视为「原语种候选」，
+    # 避免被全部排除后回退到任意 subtitles[0] 导致语种错乱（用户反馈：日语视频拿到 ES/AR 轨）。
+    ai_originals = [
+        s for s in subtitles
+        if _is_machine_translation(s.get("lan", ""))
+        and "zh" not in (s.get("lan", "") or "").lower()
+    ]
+    if ai_originals:
+        return ai_originals[0], True  # degraded：提示这是 AI 字幕非原声
     # 降级：只有中文（可能是中文原声，或 B站只提供了中文机翻）
     zh = next(
         (s for s in subtitles if "zh" in (s.get("lan", "") or "").lower()),
