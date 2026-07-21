@@ -610,7 +610,7 @@ def _short_mode_label(mode: str, keywords: str = "") -> str:
         if len(kw) > 15:
             kw = kw[:15] + "…"
         return f"自定义-{kw}"
-    return {"concise": "精简", "detailed": "详细", "fulltext": "全文文案"}.get(mode, mode)
+    return {"concise": "精简", "detailed": "详细", "query": "自定义", "fulltext": "全文文案"}.get(mode, mode)
 
 
 def _estimate_transcribe_time(duration: float, whisper_cfg=None) -> str:

@@ -49,8 +49,9 @@ def test_safe_title_multipp_strips_prefix():
         page_index = 0  # -> P1
 
     name = exporter._safe_title(T(), "全文文案")
-    # 文件名应以 -P1 结尾，且不应再含 "P1 · " 前缀（避免重复）
-    assert name.endswith("-P1"), name
+    # 新规则：视频名-P1-摘要-全文文案（Pxx 紧跟视频名、在「摘要」之前）
+    assert "-P1-" in name, name
+    assert name.endswith("-全文文案"), name
     assert "P1 · " not in name, name
     assert "全文文案" in name
 
@@ -70,7 +71,8 @@ def test_safe_title_singlep_no_suffix():
 
     name = exporter._safe_title(T(), "精简")
     assert "-P" not in name, name
-    assert name.endswith("精简")
+    # 单P 新格式：视频名-摘要-模式（用精确字符串锁定，防止回归）
+    assert name == "普通单P视频标题-摘要-精简", name
 
 
 def test_select_formats_all():

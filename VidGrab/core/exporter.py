@@ -6,11 +6,11 @@
   export(summary, output, transcript, formats) -> List[Path]
   export_markdown / export_html / export_docx / export_image  单格式快捷入口
 
-文件命名规则：{标题摘要}[-P{n}].{扩展名}
+文件命名规则：{视频名}[-P{n}][-摘要][-模式].{扩展名}
   - 标题中的非法文件名字符（\\/:*?"<>|）会被替换为下划线
-  - 标题过长（>30 字）自动截断为「前 20 字 + …」的标题摘要形式
-  - 合集视频追加 -P{n}（n 为选中集，1-based）；单P 视频不带 -P
-  - 文件名始终带「摘要」二字，表明这是摘要文档
+  - 标题过长（>30 字）自动截断为「前 29 字 + …」的形式（标题部分最多 30 字）
+  - 合集视频紧跟视频名追加 -P{n}（n 为选中集，1-based）；单P 视频不带 -P
+  - 文件名始终带「摘要」二字，并追加模式（精简/详细/自定义/全文文案），避免互相覆盖
 """
 
 from __future__ import annotations
@@ -41,19 +41,21 @@ _TITLE_DIGEST = 29    # 截断后保留前 29 字 + "…"，标题部分最多 3
 def _safe_title(transcript: Transcript, mode_label: str = "") -> str:
     """生成安全的输出文件名（不含扩展名）。
 
-    规则（用户 2026-07-20 指定）：
-      - 标题部分不长（<= _TITLE_MAX）：用完整标题；
-      - 标题部分过长（> _TITLE_MAX）：改为「前 _TITLE_DIGEST 字 + …」的标题摘要，
-        标题部分最多 30 字；
-      - 始终带「摘要」二字，表明这是摘要文档；
-      - 合集：文件名追加 -P{n}（n 为选中集，1-based）；单P 视频不带 -P。
-      - 追加模式标识（精简/详细/自定义），避免不同模式输出互相覆盖。
-      - 注意："摘要"、"-Pxx"、"-精简" 等后缀不计入 30 字限制。
+    文件名规则（用户 2026-07-21 确认）：
+      {视频名(≤30字截断)}[-P{n}][-摘要][-模式].{ext}
+      - 视频名：标题部分（正文标题的「P{n} · 」前缀在文件名中会被剥离，
+        改由 -P{n} 后缀体现，避免重复）
+      - 标题过长（> _TITLE_MAX）：截断为「前 _TITLE_DIGEST 字 + …」，标题部分最多 30 字
+      - 合集（多P）：紧跟视频名追加 -P{n}（n 为选中集，1-based）
+      - 始终带「摘要」标识（表明这是摘要文档）
+      - 末尾追加模式标识（精简/详细/自定义/全文文案），避免不同模式输出互相覆盖
+      - 注意：「摘要」「-Pxx」「-精简」等后缀均不计入 30 字限制
 
     示例：
-      短标题单P-精简     -> 如何三天搞定深度学习摘要-精简.md
-      长标题单P-详细     -> 从零开始学Blender建模渲染全流程详解…摘要-详细.md
-      长标题合集P92-精简 -> 从零开始学Blender建模渲染全流程详解…摘要-精简-P92.md
+      单P-精简           -> 视频名-摘要-精简.md
+      单P-全文文案       -> 视频名-摘要-全文文案.md
+      长标题单P-详细     -> 从零开始学Blender建模渲染全流程详解…-摘要-详细.md
+      长标题合集P92-精简 -> 从零开始学Blender建模渲染全流程详解…-P92-摘要-精简.md
     """
     title = transcript.title or f"{transcript.platform.value}_{transcript.video_id}"
     title = _ILLEGAL_CHARS.sub("_", title).strip().strip(".")
@@ -61,17 +63,21 @@ def _safe_title(transcript: Transcript, mode_label: str = "") -> str:
     # 文件名统一用 -P{n} 后缀体现，这里剥离前缀避免重复出现。
     title = re.sub(r"^P\d+\s*[·・\-]\s*", "", title)
 
-    # 标题过长则改为「标题摘要」（截断 + 省略号）
+    # 标题过长则截断（前 29 字 + 省略号），标题部分最多 30 字。
+    # 注意：若截断点恰好落在标题自带的「 - 」分隔横线上（如「… - 中英字幕」），
+    # 需把尾部的横线和空格剥掉，让省略号干净地接在正文后（用户 2026-07-21 确认的写法）。
     if len(title) > _TITLE_MAX:
-        title = title[:_TITLE_DIGEST].rstrip() + "…"
+        _cut = title[:_TITLE_DIGEST].rstrip().rstrip("-").rstrip()
+        title = _cut + "…"
 
-    # 始终带「摘要」标识；追加模式标识；合集（多P）追加 -P{n}，单P 视频不带 -P
-    name = f"{title}摘要"
-    if mode_label:
-        name = f"{name}-{mode_label}"
+    # 组装顺序：视频名 + (合集 -P{n}) + -摘要 + (-模式)
+    name = title
     if transcript.is_collection:
         n = (transcript.page_index or 0) + 1
         name = f"{name}-P{n}"
+    name = f"{name}-摘要"
+    if mode_label:
+        name = f"{name}-{mode_label}"
     return name
 
 
