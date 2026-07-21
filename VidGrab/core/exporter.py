@@ -113,7 +113,7 @@ def _build_html(summary: Summary) -> str:
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>{summary.title} - 摘要</title>
+<title>{summary.title} - {summary.mode_label or '精简'} - 摘要</title>
 <style>
   body {{ font-family: -apple-system, "Microsoft YaHei", "PingFang SC", sans-serif; max-width: 800px; margin: 2em auto; padding: 0 1em; line-height: 1.8; color: #333; }}
   h2 {{ border-bottom: 2px solid #4a90d9; padding-bottom: 0.3em; color: #2c3e50; }}
@@ -243,7 +243,8 @@ def export_pdf(summary: Summary, output: OutputConfig, transcript: Transcript, m
     story = []
 
     # 标题
-    story.append(Paragraph(_md_bold_to_html(summary.title), title_style))
+    title_text = f"{summary.title} - {summary.mode_label or '精简'}"
+    story.append(Paragraph(_md_bold_to_html(title_text), title_style))
 
     # 基本信息
     story.append(Paragraph("基本信息", h2_style))
@@ -346,7 +347,8 @@ def export_docx(summary: Summary, output: OutputConfig, transcript: Transcript, 
     doc = Document()
 
     # 标题
-    h = doc.add_heading(summary.title, level=1)
+    title_text = f"{summary.title} - {summary.mode_label or '精简'}"
+    h = doc.add_heading(title_text, level=1)
 
     # 基本信息 + 内容概述
     doc.add_heading("基本信息", level=2)
@@ -584,7 +586,8 @@ def export_image(summary: Summary, output: OutputConfig, transcript: Transcript,
     y = PAD
 
     # 标题
-    title_lines = wrap_plain(summary.title or "视频摘要", F_TITLE, CW)
+    title_text = f"{summary.title or '视频摘要'} - {summary.mode_label or '精简'}"
+    title_lines = wrap_plain(title_text, F_TITLE, CW)
     title_h = len(title_lines) * (F_TITLE.size + 4)
     y += title_h + 6
 

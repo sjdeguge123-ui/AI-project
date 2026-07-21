@@ -382,6 +382,13 @@ def generate_summary(
         _parse_quotes(merged.get("golden_quotes")) or all_quotes, cap=5
     )
 
+    # 模式标签：渲染在标题后，如 "标题 - 精简" / "标题 - 详细" / "标题 - 自定义：聚类"
+    mode_label = {
+        "concise": "精简",
+        "detailed": "详细",
+        "query": f"自定义：{query[:30]}{'…' if len(query) > 30 else ''}",
+    }.get(mode, "精简")
+
     return Summary(
         title=transcript.title,
         source=transcript.platform.label,
@@ -391,4 +398,5 @@ def generate_summary(
         content_overview=str(merged.get("content_overview", "")),
         detailed=detailed,
         golden_quotes=golden_quotes,
+        mode_label=mode_label,
     )

@@ -87,6 +87,7 @@ def _mock_summary() -> Summary:
             DetailedRow(timestamp="01:10", point="**无监督学习**", content="无需标签，**聚类**是代表。", remark=""),
         ],
         golden_quotes=[GoldenQuote(timestamp="02:00", text="**强化学习**通过奖励信号学习。")],
+        mode_label="精简",
     )
 
 

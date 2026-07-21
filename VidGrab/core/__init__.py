@@ -92,6 +92,7 @@ class Summary:
     detailed: List[DetailedRow] = field(default_factory=list)  # 详细内容表格（含每段时间的核心要点）
     golden_quotes: List[GoldenQuote] = field(default_factory=list)  # 金句模块（带时间戳，2-5 条）
     conclusion: str = ""        # 总结段落
+    mode_label: str = "精简"    # 内容模式标签，渲染在标题后：标题 - 精简/详细/自定义：xxx
 
 
 def format_timestamp(seconds: float) -> str:

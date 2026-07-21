@@ -14,7 +14,7 @@ from __future__ import annotations
 from . import DetailedRow, Summary
 
 SUMMARY_MD_TEMPLATE = """\
-## 视频摘要：{title}
+## 视频摘要：{title} - {mode_label}
 
 ### 基本信息
 - 来源：{source}
@@ -54,6 +54,7 @@ def render_summary_md(summary: Summary) -> str:
 
     return SUMMARY_MD_TEMPLATE.format(
         title=summary.title,
+        mode_label=summary.mode_label or "精简",
         source=summary.source or "未知",
         author=summary.author or "未知",
         publish_time=summary.publish_time or "未知",
