@@ -11,7 +11,7 @@
 - 整体结论：🟢 **通过（无功能回归）**
 - 阻塞项数量：**0**（唯一已知失败为预存在环境性问题，与本次改动无关）
 - 核心修复：commit `f3d25ea`「透传权威语种信号」——删除了 `transcriber.py` 用文本启发式覆盖 whisper/B站权威语种的逻辑，改为从入口透传 `info.language` / `lan`，根治纯汉字日语/韩语视频被误判为 zh/en。
-- 验证：独立 QA 重跑编译 + 4 项新增/既有功能测试 + `simulate_new_user` 全绿（13/13）；全套 `pytest` 因沙箱环境性失败无法整体跑，但已证明属预存在问题。
+- 验证：独立 QA 重跑编译 + 4 项新增/既有功能测试 + `simulate_new_user` 全绿（13/13）；**第二独立验证（`-s` 关闭 capture）下全套 `pytest` 31 passed / 0 failed 全绿**；默认 capture 下的崩溃是**预存在环境性副作用**（与本次改动无关，父提交同样复现）。
 - 下一步：本地 commit 收口 → 23:00 提醒 push 确认 → 用户本机真实环境验证日韩/繁体视频 + 重启清理历史僵尸进程。
 
 ---
@@ -35,7 +35,7 @@
 
 ### ✅ 质量门神（QA 测试与发布）
 - 核心判断：**`f3d25ea` 未引入任何功能回归**。编译全过；`test_whisper_lang_passthrough` 4/4（ja/ko/en 透传 + `.lang` side-file 读取）、`test_resume` 1/1、`test_language_consistency` 3/3、`test_chinese_normalization` 5/5、`simulate_new_user` 13/13 全绿。
-- 关键建议：全套 `pytest` 在本沙箱导入即崩（`lost sys.stderr`），根因是 `transcribe_worker.py` 在**模块导入时**重写 `sys.stdout/stderr`，与受限沙箱 pytest 捕获冲突；该重写存在于父提交 `39ab41b`，属**预存在问题**（已 `git checkout` 父提交复现验证），且除 `test_language_auto.py` 外还拖垮 `test_issue_fixes::test_select_formats_all`。建议为导入期 stdout/stderr 重写加护栏（仅非 pytest/子进程模式执行，或 `try-except` 包裹）。
+- 关键建议：全套 `pytest` 在**默认 capture 下**于 teardown 崩（`lost sys.stderr` / I/O on closed file），根因是 `transcribe_worker.py` 在**模块导入时**重写 `sys.stdout/stderr`，与受限沙箱 pytest 捕获冲突；但加 `-s`（关闭 capture）后**全套 31 passed / 0 failed 全绿**。该崩在父提交 `39ab41b`（核心源码回退）同样复现，属**预存在环境副作用**（非回归），且除 `test_language_auto.py` 外还拖垮 `test_issue_fixes::test_select_formats_all`。建议为导入期 stdout/stderr 重写加护栏（仅非 pytest/子进程模式执行，或 `try-except` 包裹）。
 
 > 本场景未调度安全官 / 设计师 / 排障手，故不列。
 
@@ -45,7 +45,7 @@
 
 | # | 严重度 | 类别 | 位置 | 问题描述 | 建议 | 来源成员 |
 |---|--------|------|------|---------|------|---------|
-| 1 | 🟡 | 测试环境/健壮性 | `core/transcribe_worker.py` L28–33（导入期） | 导入时无条件重写 `sys.stdout/stderr`，导致本沙箱全套 `pytest` 崩溃，并令 `test_language_auto.py` 与 `test_issue_fixes::test_select_formats_all` 失败。该代码自父提交 `39ab41b` 起即存在，**非本次回归**。 | 加护栏：仅当非 pytest 且为子进程模式时重写，或用 `try-except` 包裹，恢复全套可跑性。 | 质量门神 |
+| 1 | 🟡 | 测试环境/健壮性 | `core/transcribe_worker.py` L28–33（导入期） | 导入时无条件重写 `sys.stdout/stderr`，导致本沙箱**默认 capture 下**全套 `pytest` teardown 崩溃，并令 `test_language_auto.py` 与 `test_issue_fixes::test_select_formats_all` 失败；加 `-s` 后全套 **31 passed / 0 failed 全绿**。该崩在父提交 `39ab41b`（核心源码回退）同样复现，**非本次回归**。 | 加护栏：仅当非 pytest 且为子进程模式时重写，或用 `try-except` 包裹，恢复默认 capture 下全套可跑性。 | 质量门神 |
 | 2 | 🟢 | 功能（已修复） | `core/transcriber.py` / `core/platforms/bilibili.py` / `core/summarizer.py` | 纯汉字日/韩视频语种被文本启发式误判。已通过透传 `info.language` / `lan` 修复，新增 `test_whisper_lang_passthrough` 覆盖 ja/ko/en 三路径。 | 无需动作；真实环境复跑确认即可。 | 产品官 + 质量门神 |
 
 ---
@@ -63,7 +63,7 @@
 
 ## ⚠️ 待完善 / 已知局限
 
-- **本沙箱无法整体跑全套 pytest**（环境性），只能逐文件验证；真实回归风险需在能跑全套的环境由用户最终确认。
+- **本沙箱默认 capture 下无法整体跑全套 pytest**（teardown 崩，环境副作用）；但加 `-s` 可整体跑且 **31 passed / 0 failed 全绿**，已实质确认无回归。真实长音频续传路径仍建议用户在真实环境最终确认。
 - **API 路径（云端 Whisper）仍用文本启发式 `_detect_language`** 判定语种——仅 local 路径信任透传信号。云端不返回 `info.language` 时启发式是合理 fallback，且 `test_language_consistency` 已覆盖；但与「信任权威信号」原则在 API 路径上未完全对齐，后续若云端支持语种返回可进一步统一。
 - 日文/韩文字幕的标点恢复（`_restore_punctuation`）在 `is_zh` 守卫下不会对 ja/ko 套用中文标点，符合预期。
 - `test_language_auto.py` / `test_issue_fixes::test_select_formats_all` 的失败**不代表代码缺陷**，仅沙箱导入副作用；修复项 2 落地后即恢复。
@@ -74,7 +74,7 @@
 
 - gstack-product-reviewer（产品官）原始产出：P0 评估「信任真实语种信号」——识别 `transcriber.py:169` 覆盖逻辑为根因，要求透传 `lan`/`info.language`（上轮会话产出）。
 - gstack-qa-lead（质量门神）原始产出：本次独立验证报告（见上方 teammate-message 全文）——编译通过、功能测试全绿、全套崩溃为预存在环境失败（已 checkout 父提交复现确认）。
-- gstack-qa-lead-3（质量门神·复核）：同步派发的第二独立验证，结论预期与 qa-lead-2 一致，用于交叉确认。
+- gstack-qa-lead-3（质量门神·复核）：第二独立验证，结论与 qa-lead-2 一致（**NO regression, GO**）；并实测 `-s` 下全套 `pytest` **31 passed / 0 failed 全绿**，且预存在崩在父提交核心源码回退后同样复现。
 
 ---
 
