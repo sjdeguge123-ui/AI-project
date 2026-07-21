@@ -81,9 +81,29 @@ def test_select_formats_all():
     assert m._select_formats(forced="全选") == ["markdown", "html", "docx", "pdf", "image"]
 
 
+def test_language_instruction_follows_video():
+    # 摘要语言必须跟随视频真实语种（用户明确要求：不能一律中文）
+    from core import summarizer
+
+    zh = summarizer._language_instruction("zh")
+    en = summarizer._language_instruction("en")
+    auto = summarizer._language_instruction("")
+    auto2 = summarizer._language_instruction("auto")
+
+    # 中文视频：简体中文 + 中文标点（满足用户硬性要求）
+    assert "简体中文" in zh
+    assert "中文标点" in zh or "逗号" in zh
+    # 英文视频：英文输出，绝不强制中文
+    assert "English" in en
+    assert "简体中文" not in en
+    # 未知/auto/空：跟随视频真实语种，不强行统一成中文
+    assert "跟随" in auto and "跟随" in auto2
+
+
 if __name__ == "__main__":
     test_detect_language()
     test_safe_title_multipp_strips_prefix()
     test_safe_title_singlep_no_suffix()
     test_select_formats_all()
+    test_language_instruction_follows_video()
     print("ALL ISSUE-FIX TESTS PASSED")

@@ -223,14 +223,32 @@ def _raw_content(raw) -> str:
 
 
 def _language_instruction(language: str) -> str:
-    """摘要输出语言指令：用户要求【始终】用简体中文（含中文标点）输出。
+    """摘要输出语言指令：跟随视频真实语种动态变化（用户明确要求）。
+
+    - 中文视频（zh）：简体中文 + 中文标点（用户硬性要求：中文必须简体 + 逗号句号断句）。
+    - 英文视频（en）：英文输出。
+    - 未知/auto/空：跟随视频音频的实际语种；若音频为中文则用简体中文 + 中文标点，
+      否则用与音频一致的语言。不强行统一成中文。
 
     全文文案（transcript）跟随音频真实语种，由 _restore_punctuation 的语种守卫控制，
-    不在此处处理。摘要无论视频是什么语种都按用户要求输出简体中文。
+    不在此处处理。
     """
+    lang = (language or "").lower()
+    if lang == "en":
+        return (
+            "Output entirely in English, with natural English punctuation and sentence breaks. "
+            "Keep the narrative language English; proper nouns in other languages may stay in original."
+        )
+    if lang == "zh":
+        return (
+            "全部用简体中文输出，并使用中文标点（逗号、句号、问号、感叹号、顿号等）正常断句；"
+            "涉及外文专有名词可保留原文（如英文术语、人名），但叙述语言必须是简体中文。"
+        )
+    # auto / 空 / 其他未知：跟随视频实际语种，不强行统一为中文
     return (
-        "全部用简体中文输出，并使用中文标点（逗号、句号、问号、感叹号、顿号等）正常断句；"
-        "涉及外文专有名词可保留原文（如英文术语、人名），但叙述语言必须是简体中文。"
+        "请使用与视频音频相同的语言输出（跟随视频真实语种，不要擅自切换语言）；"
+        "若视频为中文，则用简体中文并加中文标点（逗号、句号等）正常断句，"
+        "若视频为英文等其他语种则用对应语言并正常断句。"
     )
 
 
