@@ -104,7 +104,7 @@ def main() -> int:
         from core.transcriber import _run_local_transcription
         from core import Segment
 
-        segments = _run_local_transcription(
+        segments, detected_language = _run_local_transcription(
             Path(args.audio_path),
             args.model_size,
             device=args.device,
@@ -125,6 +125,17 @@ def main() -> int:
             json.dump(data, f, ensure_ascii=False)
             f.flush()
             os.fsync(f.fileno())
+        # 透传 faster-whisper 检测到的权威语种（info.language），供主流程信任，
+        # 避免纯汉字日语/韩语被文本启发式误判成中文（产品评审 P0）。
+        # 用独立 side-file，不污染 segments JSON 契约。
+        if detected_language:
+            try:
+                with open(str(args.output_json) + ".lang", "w", encoding="utf-8") as lf:
+                    lf.write(detected_language)
+                    lf.flush()
+                    os.fsync(lf.fileno())
+            except Exception:  # noqa: BLE001
+                pass
         print(f"_WORKER_DONE segments={len(segments)}")
         sys.stdout.flush()
         sys.stderr.flush()

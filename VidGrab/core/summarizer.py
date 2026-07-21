@@ -120,8 +120,10 @@ def _chunk_segments(segments: List[Segment], max_chars: int = _CHUNK_MAX_CHARS) 
     return chunks
 
 
-def _build_chunk_text(chunk: List[Segment]) -> str:
-    is_zh = _detect_language(chunk) == "zh"
+def _build_chunk_text(chunk: List[Segment], lang: str = "") -> str:
+    # 优先信任透传语种（transcript.language），仅在未提供时退回文本启发式判定。
+    # 这样纯汉字日语/韩语不会被误判成中文而错做繁简转换（产品评审 P0）。
+    is_zh = (lang or _detect_language(chunk)) == "zh"
     if is_zh:
         return "\n".join(
             f"[{format_timestamp(s.start)}] {_normalize_chinese(s.text or '')}" for s in chunk
@@ -411,7 +413,7 @@ def _build_mode_instructions(mode: str, query: str) -> tuple:
     return mode_inst, query_inst
 
 
-def _build_full_text(segments: List[Segment], interval_sec: int = 180, max_chars: int = 30000) -> str:
+def _build_full_text(segments: List[Segment], interval_sec: int = 180, max_chars: int = 30000, lang: str = "") -> str:
     """把转录片段拼成连续文案，每隔约 interval_sec 秒插入一个 [MM:SS] 时间戳。
 
     用于「全文文案」模式：保留完整原文，仅用时间戳标出视频进度，方便回看定位。
@@ -420,7 +422,7 @@ def _build_full_text(segments: List[Segment], interval_sec: int = 180, max_chars
     中文视频：对每段文本做繁简转换，确保输出为简体中文（B站常见繁体/台湾字幕）。
     """
 
-    is_zh = _detect_language(segments) == "zh"
+    is_zh = (lang or _detect_language(segments)) == "zh"
     buf: List[str] = []
     last_ts = -1e9
     chars = 0
@@ -447,7 +449,7 @@ def _generate_overview(transcript, client, ai: AIConfig, proxy: str, rate_limite
     失败则回退用视频开头首句，保证基本信息不为空。
     """
 
-    head = _build_chunk_text(transcript.segments)[:1500]
+    head = _build_chunk_text(transcript.segments, transcript.language or "")[:1500]
     overview_lang = transcript.language or _detect_language(transcript.segments) or "en"
     sys_p = (
         "你是视频内容分析助手。"
@@ -536,9 +538,9 @@ def generate_summary(
 
     # 全文文案模式：不调 AI 分章，直接输出带时间戳的连续转录文案（内容概述仍用一次轻量调用生成）
     if mode == "fulltext":
-        full_text = _build_full_text(transcript.segments)
-        # 仅当转录文本确为「真实中文」时才做轻量标点恢复；英文/未知语种不强行加中文标点
-        if _detect_language(transcript.segments) == "zh":
+        full_text = _build_full_text(transcript.segments, lang=transcript.language or "")
+        # 仅当 transcript 确为「真实中文」时才做轻量标点恢复；英文/日韩/未知语种不强行加中文标点
+        if transcript.language == "zh":
             full_text = _restore_punctuation(full_text, client, ai, proxy)
         try:
             overview = _generate_overview(transcript, client, ai, proxy, rate_limiter)
@@ -572,7 +574,7 @@ def generate_summary(
     all_quotes: List[GoldenQuote] = []
 
     for i, chunk in enumerate(chunks):
-        text = _build_chunk_text(chunk)
+        text = _build_chunk_text(chunk, detected_lang)
         start_ts = format_timestamp(chunk[0].start)
         end_ts = format_timestamp(chunk[-1].end)
 

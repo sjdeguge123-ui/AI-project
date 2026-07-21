@@ -64,3 +64,24 @@ def _normalize_chinese(text: str) -> str:
         return converter.convert(text)
     except Exception:  # noqa: BLE001
         return text
+
+
+def _map_bili_lang(lan: str) -> str:
+    """把 B站字幕/视频的 lan 字段归一为内部语种码（zh/ja/ko/en）。
+
+    B站 subtitle.lan 形如 "zh-CN" / "zh-Hans" / "ja" / "ko" / "en" / "ai-zh" 等。
+    仅对「辨识度高、元数据可靠」的日文/韩文/英文直接采用；zh 退回文本判定，
+    避免元数据标错把英文/日文视频误判成中文。无法识别的返回 '' 交给上层回退。
+    """
+    lan = (lan or "").lower().strip()
+    if not lan:
+        return ""
+    base = lan.split("-")[0]
+    if base in ("ja", "jp"):
+        return "ja"
+    if base == "ko":
+        return "ko"
+    if base == "en":
+        return "en"
+    # zh / cn / ai-zh 等：退回 _detect_language 文本判定，避免元数据误标
+    return ""

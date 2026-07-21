@@ -11,10 +11,10 @@ from __future__ import annotations
 import re
 import tempfile
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from .. import Platform, Segment, Transcript
-from ..lang import _detect_language, _normalize_chinese
+from ..lang import _detect_language, _normalize_chinese, _map_bili_lang
 from ..subtitles.parsers import parse_bilibili_json, _ts_to_date
 from ..guide import bilibili_login_guide
 from ._ytdlp import _ydl_extract_subtitles, _ydl_download_audio
@@ -162,6 +162,7 @@ def extract_bilibili(
     #    ⚠️ cid 已在上面按「合集选中页 / 单P」算好；这里【不可】再覆盖成整视频的 cid，
     #    否则合集会取到第 1 集字幕（用户选了 P92 却得到 P1 内容）。仅当 cid 缺失时补取。
     segments: List[Segment] = []
+    subtitle_lang: str = ""
     try:
         if not cid:
             try:
@@ -171,7 +172,7 @@ def extract_bilibili(
                 cid = None
         if cid:
             sub_info = sync(v.get_subtitle(cid=cid)) or {}
-            segments = _fetch_bilibili_subtitle(sub_info, workdir)
+            segments, subtitle_lang = _fetch_bilibili_subtitle(sub_info, workdir)
     except Exception as exc:  # noqa: BLE001
         print(f"[bilibili] bilibili_api 取字幕失败（{exc}），回退 yt-dlp")
 
@@ -192,7 +193,7 @@ def extract_bilibili(
             source="subtitle",
             page_index=page_index,
             is_collection=is_collection,
-            language=_detect_language(segments),
+            language=subtitle_lang or _detect_language(segments),
         )
 
     if download_audio:
@@ -223,7 +224,7 @@ def extract_bilibili(
     )
 
 
-def _fetch_bilibili_subtitle(sub_info: dict, workdir: Optional[Path]) -> List[Segment]:
+def _fetch_bilibili_subtitle(sub_info: dict, workdir: Optional[Path]) -> Tuple[List[Segment], str]:
     """从 bilibili_api 返回的 subtitle 结构里，下载并解析首选（优先中文）字幕。"""
 
     import requests
@@ -246,13 +247,17 @@ def _fetch_bilibili_subtitle(sub_info: dict, workdir: Optional[Path]) -> List[Se
     resp.raise_for_status()
     path.write_bytes(resp.content)
     segments = parse_bilibili_json(path)
-    # B站字幕可能是繁体/台湾字幕（zh-Hant），统一规范为简体中文
-    if _detect_language(segments) == "zh":
+    # 信任 B站字幕自带的 lan 信号（ja/ko/en 等）作为权威语种，仅在缺失/未知时
+    # 回退到文本字符脚本判定——避免纯汉字日语/韩语被误判成中文（产品评审 P0）。
+    declared = _map_bili_lang(chosen.get("lan", ""))
+    lang = declared or _detect_language(segments)
+    # 中文（含繁体/台湾字幕）统一规范为简体中文
+    if lang == "zh":
         segments = [
             Segment(start=s.start, end=s.end, text=_normalize_chinese(s.text or ""))
             for s in segments
         ]
-    return segments
+    return segments, lang
 
 
 def _extract_bilibili_subtitle_via_ytdlp(url: str, workdir: Optional[Path]) -> List[Segment]:

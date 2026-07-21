@@ -22,7 +22,7 @@ import subprocess
 import sys
 import time as _time
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from . import Segment, Transcript
 from .config import WhisperConfig
@@ -151,22 +151,30 @@ def transcribe(transcript: Transcript, config: Optional[WhisperConfig] = None) -
         raise FileNotFoundError(f"音频文件不存在：{audio_path}")
 
     if config.mode == "api":
+        # API 路径：OpenAI 不返回权威语种，沿用文本启发式判定（兼容 API 测试）
         segments = _transcribe_api(audio_path, config.api_key, language=getattr(config, "language", None))
+        detected_language = _detect_language(segments)
     elif config.mode == "local":
-        segments = _transcribe_local(
+        # 本地路径：优先信任 faster-whisper 透传的 info.language（权威语种信号），
+        # 仅当透传为空（极少数情况）才退回文本启发式兜底——
+        # 避免纯汉字日语/韩语被误判成中文（产品评审 P0）
+        segments, detected_language = _transcribe_local(
             audio_path,
             config.local_model,
             device=getattr(config, "device", "auto"),
             compute_type=getattr(config, "compute_type", "auto"),
             language=getattr(config, "language", None),
         )
+        if not detected_language:
+            detected_language = _detect_language(segments)
     else:
         raise ValueError(
             f"未知的 whisper.mode：{config.mode!r}（应为 'api' 或 'local'）。\n{build_whisper_guide()}"
         )
 
-    # 根据实际转录结果判定语种，确保后续摘要/全文文案跟随音频真实语种
-    detected_language = _detect_language(segments)
+    # 根据实际转录结果判定语种，确保后续摘要/全文文案跟随音频真实语种。
+    # detected_language 已优先采用权威信号（faster-whisper info.language / B站 lan），
+    # 此处仅对中文做繁简规范，不再用文本启发式覆盖权威语种。
     # 中文音频转录结果统一规范为简体中文（覆盖繁体口音/台湾用字）
     if detected_language == "zh":
         from .lang import _normalize_chinese
@@ -254,7 +262,7 @@ def _run_local_transcription(
     chunk_sec: int = 120,
     resume_sec: float = 0.0,
     language: Optional[str] = None,
-) -> List[Segment]:
+) -> Tuple[List[Segment], Optional[str]]:
     """本地 faster-whisper 推理（实际执行体，运行在隔离子进程内）。
 
     device: auto（自动检测）| cpu | cuda
@@ -353,7 +361,7 @@ def _run_local_transcription(
     # 每块特征数组只有几分钟大小（峰值降两个数量级），并按块起点偏移拼接时间戳。
     # 每块成功后原子写 progress.json，崩溃可续传，避免反复从头重跑吃满页面文件。
     print("   🎙️ 开始转录，请稍候（长音频自动分块，期间会显示进度）...")
-    segments = _transcribe_chunked(
+    segments, detected_language = _transcribe_chunked(
         model,
         wav_path,
         chunk_sec=chunk_sec,
@@ -362,7 +370,7 @@ def _run_local_transcription(
         existing_segments=existing_segments,
         language=language,
     )
-    return segments
+    return segments, detected_language
 
 
 def _transcribe_local(
@@ -371,7 +379,7 @@ def _transcribe_local(
     device: str = "auto",
     compute_type: str = "auto",
     language: Optional[str] = None,
-) -> List[Segment]:
+) -> Tuple[List[Segment], Optional[str]]:
     """本地 faster-whisper 转录（子进程隔离版）。
 
     把 GPU/CUDA 重活放进独立子进程（core/transcribe_worker.py），子进程退出时 CUDA 状态
@@ -482,6 +490,7 @@ def _transcribe_local(
         _ACTIVE_WORKER = None
 
         if rc == 0 and json_path.exists():
+            detected_language: Optional[str] = None
             try:
                 with open(json_path, "r", encoding="utf-8") as f:
                     raw = json.load(f)
@@ -489,9 +498,17 @@ def _transcribe_local(
                     Segment(start=float(d["start"]), end=float(d["end"]), text=str(d["text"]))
                     for d in raw
                 ]
+                # 读取 worker 透传的语种（faster-whisper 的 info.language），优先信任，
+                # 避免纯汉字日语/韩语被文本启发式误判成中文（产品评审 P0）
+                detected_language = _read_worker_lang(json_path)
             finally:
                 try:
                     json_path.unlink()
+                except Exception:  # noqa: BLE001
+                    pass
+                # 清理透传语种 side-file（成功路径，避免残留）
+                try:
+                    Path(str(json_path) + ".lang").unlink()
                 except Exception:  # noqa: BLE001
                     pass
                 # 成功：删除断点进度文件（避免下次误续传旧音频残留）
@@ -499,7 +516,7 @@ def _transcribe_local(
                     progress_path.unlink()
                 except Exception:  # noqa: BLE001
                     pass
-            return segments
+            return segments, detected_language
 
         # 失败：识别 OOM 类信号（页面文件/显存/内存分配），连续 2 次则早停，避免反复重启吃满页面文件
         child_text = "\n".join(child_log)
@@ -565,6 +582,22 @@ def _is_oom_failure(text: str) -> bool:
     return any(sig in text for sig in _OOM_SIGNALS)
 
 
+def _read_worker_lang(json_path: Path) -> Optional[str]:
+    """读取 worker 子进程透传的语种 side-file（<output-json>.lang）。
+
+    worker 把 faster-whisper 检测到的 info.language 写入该 side-file（不破坏 segments JSON 契约）。
+    文件不存在或读取失败返回 None，由调用方退回文本启发式兜底。
+    """
+    lang_path = Path(str(json_path) + ".lang")
+    if not lang_path.exists():
+        return None
+    try:
+        v = lang_path.read_text(encoding="utf-8").strip()
+        return v or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 # 单块采样率（固定 16kHz mono）
 _SAMPLE_RATE = 16000
 
@@ -580,7 +613,7 @@ def _transcribe_chunked(
     progress_path: Optional[Path] = None,
     existing_segments: Optional[List[dict]] = None,
     language: Optional[str] = None,
-) -> List[Segment]:
+) -> Tuple[List[Segment], Optional[str]]:
     """按固定时长用标准库 wave 分块读取 PCM 并逐块转录，拼接时间戳（支持断点续传）。
 
     为什么必须按块「流式」读取，而不是 decode_audio 整段解码：
@@ -608,6 +641,9 @@ def _transcribe_chunked(
         for d in existing_segments
     ]
     _done_existing = len(segments)
+
+    # 透传语种：显式锁定语种（config 指定）直接采用；否则首块自动检测后填充
+    detected_language: Optional[str] = language
 
     with wave.open(str(wav_path), "rb") as wf:
         fr = wf.getframerate()
@@ -654,6 +690,15 @@ def _transcribe_chunked(
                     "      或改用 whisper.mode: api 云端转录。"
                 ) from exc
 
+            # 首次自动检测到的语种：faster-whisper 的权威判定，优先信任
+            # （避免纯汉字日语/韩语被文本启发式误判成中文）。一旦检测到即锁定，
+            # 后续块沿用同一语种，避免逐块重检测导致漂移。
+            if language is None and _info is not None:
+                _dl = getattr(_info, "language", None)
+                if _dl:
+                    language = _dl
+                    detected_language = _dl
+
             for seg in seg_gen:
                 text = (seg.text or "").strip()
                 if text:
@@ -682,7 +727,7 @@ def _transcribe_chunked(
             # 主动 GC，降低长音频多段情况下的内存碎片
             gc.collect()
 
-    return segments
+    return segments, detected_language
 
 
 def _write_progress_atomic(progress_path: Path, completed_until_sec: float, segments: List[Segment]) -> None:

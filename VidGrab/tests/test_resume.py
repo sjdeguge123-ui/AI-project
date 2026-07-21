@@ -48,7 +48,7 @@ def test_resume_skips_completed_chunks():
 
         # 第 1 次：从头转录，应转录全部 3 块
         m1 = _FakeModel()
-        segs1 = _transcribe_chunked(m1, wav, chunk_sec=10, resume_sec=0.0, progress_path=prog)
+        segs1, _ = _transcribe_chunked(m1, wav, chunk_sec=10, resume_sec=0.0, progress_path=prog)
         assert len(segs1) == 3, segs1
         assert m1.calls == 3, m1.calls
 
@@ -61,7 +61,7 @@ def test_resume_skips_completed_chunks():
         resume = float(prog_data["completed_until_sec"])
         existing = prog_data["segments"]
         m2 = _FakeModel()
-        segs2 = _transcribe_chunked(m2, wav, chunk_sec=10, resume_sec=resume, existing_segments=existing)
+        segs2, _ = _transcribe_chunked(m2, wav, chunk_sec=10, resume_sec=resume, existing_segments=existing)
         # 已完成 2 段 + 新 1 段 = 3 段；model.transcribe 仅被调用 1 次（不从头）
         assert len(segs2) == 3, segs2
         assert m2.calls == 1, m2.calls

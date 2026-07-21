@@ -33,7 +33,7 @@ def _run_worker_with_language(lang_value: str):
     def fake_run(audio_path, model_size, device="auto", compute_type="auto",
                  chunk_sec=120, resume_sec=0.0, language=None):
         captured["language"] = language
-        return []
+        return [], None
 
     out_json = tempfile.mktemp(suffix=".json")
     old_argv = sys.argv
