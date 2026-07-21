@@ -409,7 +409,9 @@ def _restore_punctuation(text: str, client, ai: AIConfig, proxy: str = "") -> st
         return text
     # 先统一规范为简体中文（B站/YouTube 常见繁体、台湾字幕）
     text = _normalize_chinese(text)
-    if not _needs_punctuation(text):
+    # 密度守卫：仅当标点密度达标（≥0.003，约每千字 3 个标点）才视为已标点并跳过；
+    # 改用存在性判断会导致 ASR 文本混入单个「《》」「·」等符号时被误判为「已标点」而整段跳过恢复。
+    if _is_well_punctuated(text):
         return text
     sys_p = (
         "你是一个严谨的中文标点校对助手。下面是一段带 [MM:SS] 时间戳的中文语音识别原文。"
